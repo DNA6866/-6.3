@@ -1,0 +1,42 @@
+# Python / Qt cache
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Runtime workspace and generated outputs
+用户工作区/
+outputs/
+logs/
+config/
+cache/
+dist/
+build/
+
+# Large resource bundles and packaged artifacts
+网盘资源包/
+网盘资源包.7z
+已打包_*/
+已打包_*.zip
+*.7z
+*.zip
+*.rar
+
+# Local model / engine payloads
+models/
+tools/
+engines/
+workflows/
+third_party/
+
+# Local IDE / OS files
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
