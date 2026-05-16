@@ -172,7 +172,8 @@ class SynthesisEngine(QThread):
         return wm_str
 
     def process_asr_and_color(self, audio_path, cache_dir, audio_name, sub_config, sys_fonts, has_cover, gpu_mode):
-        ass_out_path = os.path.join(cache_dir, f"{audio_name}.ass")
+        safe_audio_name = re.sub(r'[^a-zA-Z0-9_\-]', '_', audio_name)[:60] or "audio"
+        ass_out_path = os.path.join(cache_dir, f"subtitle_{safe_audio_name}_{random.randint(10000, 99999)}.ass")
         if os.path.exists(ass_out_path): return ass_out_path 
         
         engine_type = "N卡加速" if "NVENC" in gpu_mode else ("A卡加速" if "AMF" in gpu_mode else "CPU满载")
@@ -317,6 +318,9 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
                     if text: events.append(f"Dialogue: 0,{start},{end},Default,,0,0,0,,{anim_str}{text}")
                 i += 1
             with open(ass_out_path, 'w', encoding='utf-8') as f: f.write(header + "\n".join(events) + "\n")
+            if not events:
+                self.log_signal.emit("⚠️ 智能字幕识别到了文本，但过滤后没有可烧录的字幕行。请调大“每行字数”或更换更清晰的音频。")
+                return None
             
             if os.path.exists(temp_wav_path): os.remove(temp_wav_path)
             if os.path.exists(temp_srt_path): os.remove(temp_srt_path)
@@ -325,6 +329,13 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
         except Exception as e:
             self.log_signal.emit(f"⚠️ 字幕处理失败: {str(e)}")
             return None
+
+    def build_subtitle_filter(self, ass_path):
+        safe_ass = path_to_ffmpeg(os.path.abspath(ass_path))
+        fonts_dir = path_to_ffmpeg("C:/Windows/Fonts") if os.name == "nt" else ""
+        if fonts_dir:
+            return f"subtitles=filename='{safe_ass}':fontsdir='{fonts_dir}'"
+        return f"subtitles=filename='{safe_ass}'"
 
     def process_single_audio(self, audio_dict, video_pool, bgm_pool, min_clip, max_clip, gpu_mode, 
                              target_res, trans_type, trans_dur, cache_dir, output_dir, covers, watermarks, 
@@ -550,8 +561,11 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
             mix_cmd.extend(['-af', f"volume={main_vol}", '-map', '0:v:0', '-map', f'{idx_a_main}:a:0'])
 
         if final_ass_path and os.path.exists(final_ass_path):
-            safe_ass = path_to_ffmpeg(final_ass_path)
-            mix_cmd.extend(['-vf', f"subtitles='{safe_ass}'"])
+            subtitle_filter = self.build_subtitle_filter(final_ass_path)
+            self.log_signal.emit(f"✅ 智能字幕文件已生成，准备烧录：{final_ass_path}")
+            mix_cmd.extend(['-vf', subtitle_filter])
+        elif sub_config.get('enable'):
+            self.log_signal.emit("⚠️ 已开启智能字幕，但没有生成可用字幕文件，本条视频将不烧录字幕。")
 
         mix_cmd.extend([
             *final_enc_args, '-pix_fmt', pix_fmt,

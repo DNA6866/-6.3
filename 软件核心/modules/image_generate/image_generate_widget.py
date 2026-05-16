@@ -280,6 +280,7 @@ class ImageGenerateWidget(QWidget):
         self.cfg_spin = QDoubleSpinBox(); self.cfg_spin.setRange(0.1, 20.0); self.cfg_spin.setSingleStep(0.1); self.cfg_spin.setValue(1.0)
         self.seed_spin = QSpinBox(); self.seed_spin.setRange(0, 2147483647); self.seed_spin.setValue(0)
         self.count_spin = QSpinBox(); self.count_spin.setRange(1, 8); self.count_spin.setValue(1)
+        self.count_spin.setToolTip("多张会按单张循环提交，不使用 ComfyUI 批量 batch，避免 20 系显卡生成糊图。")
         random_seed_btn = QPushButton("随机种子")
         random_seed_btn.setObjectName("imageActionButton")
         random_seed_btn.setMinimumHeight(34)
@@ -299,6 +300,9 @@ class ImageGenerateWidget(QWidget):
         form.addWidget(QLabel("种子"), 4, 0); form.addWidget(self.seed_spin, 4, 1)
         form.addWidget(random_seed_btn, 4, 2)
         form.addWidget(QLabel("张数"), 5, 0); form.addWidget(self.count_spin, 5, 1)
+        count_hint = QLabel("多张会逐张生成，更稳但耗时会按张数增加")
+        count_hint.setObjectName("appSubtitle")
+        form.addWidget(count_hint, 5, 2, 1, 2)
         form.addWidget(self.generate_btn, 6, 1)
         form.addWidget(self.progress, 6, 2, 1, 2)
         return params

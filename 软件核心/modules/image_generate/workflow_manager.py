@@ -76,7 +76,9 @@ def build_default_zimage_api_workflow(ui_workflow, params):
     steps = int(params.get("steps", 4))
     cfg = float(params.get("cfg", 1.0))
     seed = int(params.get("seed", 0))
-    image_count = int(params.get("image_count", 1))
+    # 低显存显卡上 Z-Image 批量 latent 容易出现糊图/异常图。
+    # 多张生成由 ImageGenerateWorker 单张循环提交，这里固定 batch_size=1。
+    image_count = 1
 
     return {
         "28": {"class_type": "UNETLoader", "inputs": {"unet_name": unet_name, "weight_dtype": "default"}},
@@ -135,7 +137,8 @@ def patch_api_workflow(workflow, params):
             if "height" in inputs:
                 inputs["height"] = int(params.get("height", inputs.get("height", 1600)))
             if "batch_size" in inputs:
-                inputs["batch_size"] = int(params.get("image_count", inputs.get("batch_size", 1)))
+                # 不使用 ComfyUI latent batch 批量生成，多张改由后台 worker 单张循环提交。
+                inputs["batch_size"] = 1
         if class_type == "SaveImage":
             inputs["filename_prefix"] = "niuyeye_zimage"
     return wf
