@@ -83,14 +83,21 @@ class ReferenceWaveform(QWidget):
     def _wave_rect(self):
         return self.rect().adjusted(8, 8, -8, -8)
 
+    def _track_rect(self):
+        return self._wave_rect().adjusted(7, 0, -7, 0)
+
     def _ratio_from_x(self, x):
-        rect = self._wave_rect()
+        rect = self._track_rect()
         if rect.width() <= 0:
             return 0.0
+        if x <= rect.left():
+            return 0.0
+        if x >= rect.right():
+            return 1.0
         return max(0.0, min(1.0, (x - rect.left()) / rect.width()))
 
     def _edge_tolerance(self):
-        rect = self._wave_rect()
+        rect = self._track_rect()
         if rect.width() <= 0:
             return 0.015
         return max(0.012, min(0.035, 10 / rect.width()))
@@ -153,12 +160,13 @@ class ReferenceWaveform(QWidget):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.Antialiasing)
         rect = self._wave_rect()
+        track = self._track_rect()
         painter.setPen(QPen(QColor("#334155"), 1))
         painter.setBrush(QBrush(QColor("#020617")))
         painter.drawRoundedRect(rect, 8, 8)
 
-        sel_left = rect.left() + int(rect.width() * self.selection_start)
-        sel_right = rect.left() + int(rect.width() * self.selection_end)
+        sel_left = track.left() + int(track.width() * self.selection_start)
+        sel_right = track.left() + int(track.width() * self.selection_end)
         painter.setPen(QPen(QColor("#38BDF8"), 1))
         painter.setBrush(QBrush(QColor(37, 99, 235, 70)))
         painter.drawRoundedRect(sel_left, rect.top() + 4, max(2, sel_right - sel_left), rect.height() - 8, 6, 6)
@@ -166,13 +174,13 @@ class ReferenceWaveform(QWidget):
         mid = rect.center().y()
         available_h = max(12, rect.height() - 18)
         if self.peaks:
-            count = min(max(1, rect.width() - 14), len(self.peaks))
+            count = min(max(1, track.width()), len(self.peaks))
             step = len(self.peaks) / max(1, count)
             for i in range(count):
-                x = rect.left() + 7 + i
+                x = track.left() + i
                 peak = self.peaks[int(i * step)]
                 bar_h = max(2, int(peak * available_h))
-                ratio = i / max(1, count)
+                ratio = i / max(1, count - 1)
                 if self.selection_start <= ratio <= self.selection_end:
                     color = QColor("#38BDF8")
                 elif ratio <= self.progress:
@@ -183,9 +191,9 @@ class ReferenceWaveform(QWidget):
                 painter.drawLine(x, mid - bar_h // 2, x, mid + bar_h // 2)
         else:
             painter.setPen(QPen(QColor("#64748B"), 2, Qt.SolidLine, Qt.RoundCap))
-            painter.drawLine(rect.left() + 12, mid, rect.right() - 12, mid)
+            painter.drawLine(track.left(), mid, track.right(), mid)
 
-        play_x = rect.left() + int(rect.width() * self.progress)
+        play_x = track.left() + int(track.width() * self.progress)
         painter.setPen(QPen(QColor("#FDE68A"), 2))
         painter.drawLine(play_x, rect.top() + 8, play_x, rect.bottom() - 8)
         painter.setPen(QPen(QColor("#FDE68A"), 2))
@@ -485,8 +493,8 @@ class VoiceCloneWidget(QWidget):
         header.addWidget(self.report_button)
         root.addLayout(header)
 
-        root.addWidget(self._build_model_group())
         root.addWidget(self._build_env_table())
+        root.addWidget(self._build_model_group())
 
         self.tabs = QTabWidget()
         self.tabs.addTab(self._build_tts_tab(), "文本转语音")
@@ -531,7 +539,8 @@ class VoiceCloneWidget(QWidget):
         self.env_table.horizontalHeader().setStretchLastSection(True)
         self.env_table.verticalHeader().setVisible(False)
         self.env_table.setAlternatingRowColors(True)
-        self.env_table.setMinimumHeight(170)
+        self.env_table.setMinimumHeight(96)
+        self.env_table.setMaximumHeight(126)
         layout.addWidget(self.env_table)
         return group
 
@@ -754,8 +763,10 @@ class VoiceCloneWidget(QWidget):
         self.ultimate_preview.selectionChanged.connect(self.on_ultimate_preview_selection_changed)
         self.ultimate_transcript = QTextEdit()
         self.ultimate_transcript.setPlaceholderText("选择参考音频后会自动识别文字稿，识别完成后可在这里校对微调。")
+        self.ultimate_transcript.setMinimumHeight(104)
         self.ultimate_text = QTextEdit()
         self.ultimate_text.setPlaceholderText("输入要生成的新文本")
+        self.ultimate_text.setMinimumHeight(86)
         param_box, self.ultimate_cfg, self.ultimate_steps = self._build_param_line()
         advanced_box, self.ultimate_normalize, self.ultimate_denoise = self._build_advanced_line(denoise=True)
         self.ultimate_generate_btn = QPushButton("生成高相似克隆")
@@ -769,6 +780,8 @@ class VoiceCloneWidget(QWidget):
         open_btn.clicked.connect(self.open_output)
         self.ultimate_transcribe_status = QLabel("选择参考音频后自动识别文字稿。")
         self.ultimate_transcribe_status.setObjectName("mutedText")
+        self.ultimate_transcribe_status.setWordWrap(True)
+        self.ultimate_transcribe_status.setMinimumHeight(34)
 
         tip = QLabel("高相似克隆会自动识别参考音频文字稿，但建议生成前人工快速校对一次，文字稿越准，相似度越稳定。")
         tip.setObjectName("mutedText")
@@ -783,10 +796,13 @@ class VoiceCloneWidget(QWidget):
         layout.setRowMinimumHeight(1, 176)
         layout.addWidget(QLabel("识别状态"), 2, 0)
         layout.addWidget(self.ultimate_transcribe_status, 2, 1, 1, 3)
+        layout.setRowMinimumHeight(2, 40)
         layout.addWidget(QLabel("参考音频文字稿"), 3, 0)
         layout.addWidget(self.ultimate_transcript, 3, 1, 1, 3)
+        layout.setRowMinimumHeight(3, 112)
         layout.addWidget(QLabel("生成文本"), 4, 0)
         layout.addWidget(self.ultimate_text, 4, 1, 1, 3)
+        layout.setRowMinimumHeight(4, 94)
         self._row("推理参数", param_box, 5, layout)
         self._row("高级选项", advanced_box, 6, layout)
         layout.addWidget(self.ultimate_generate_btn, 7, 1)
