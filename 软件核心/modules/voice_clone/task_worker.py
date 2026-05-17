@@ -48,6 +48,49 @@ def _find_ffmpeg():
     return shutil.which("ffmpeg") or ""
 
 
+def _is_ascii_path(path):
+    try:
+        str(path).encode("ascii")
+        return True
+    except Exception:
+        return False
+
+
+def _subst_ascii_dir(path):
+    """部分 ASR 底层库在 Windows 下读中文模型路径会失败，临时映射成纯英文盘符。"""
+    if os.name != "nt" or not path or _is_ascii_path(path):
+        return path, ""
+    abs_path = os.path.abspath(path)
+    if not os.path.isdir(abs_path):
+        return path, ""
+    for letter in "ZYXWVUTSRQPONMLKJIHGFEDCBA":
+        drive = f"{letter}:"
+        if os.path.exists(drive + "\\"):
+            continue
+        result = subprocess.run(
+            ["subst", drive, abs_path],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            errors="ignore",
+            startupinfo=_hidden_startupinfo(),
+        )
+        if result.returncode == 0:
+            return drive + "\\", drive
+    return path, ""
+
+
+def _release_subst_drive(drive):
+    if os.name == "nt" and drive:
+        subprocess.run(
+            ["subst", drive, "/D"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            startupinfo=_hidden_startupinfo(),
+        )
+
+
 def _clean_asr_text(text):
     text = re.sub(r"<\|[^>]+?\|>", "", text or "")
     text = re.sub(r"\s+", " ", text).strip()
@@ -313,8 +356,12 @@ class ReferenceTranscribeWorker(QThread):
 
         self.message.emit("正在使用 SenseVoice 识别参考音频文字稿...")
         self.progress.emit(35)
-        model = AutoModel(model=self.asr_model_path, trust_remote_code=False, disable_update=True)
-        result = model.generate(input=self.audio_path, language="zh", use_itn=True, batch_size_s=60)
+        model_path, subst_drive = _subst_ascii_dir(self.asr_model_path)
+        try:
+            model = AutoModel(model=model_path, trust_remote_code=False, disable_update=True)
+            result = model.generate(input=self.audio_path, language="zh", use_itn=True, batch_size_s=60)
+        finally:
+            _release_subst_drive(subst_drive)
         if isinstance(result, list) and result:
             text = result[0].get("text", "")
         elif isinstance(result, dict):
@@ -374,4 +421,7 @@ class ReferenceTranscribeWorker(QThread):
             self.message.emit("参考音频文字稿识别完成。")
             self.finished.emit(text)
         except Exception as exc:
-            self.failed.emit(f"参考音频文字稿自动识别失败：{exc}")
+            self.failed.emit(
+                "参考音频文字稿自动识别失败。请确认 SenseVoiceSmall 模型存在、参考音频有人声，"
+                f"并尽量使用 wav/mp3 格式。底层信息：{exc}"
+            )
