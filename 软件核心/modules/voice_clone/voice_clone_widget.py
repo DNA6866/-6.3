@@ -228,8 +228,8 @@ class AudioPreviewPanel(QWidget):
         self._audio_bytes_per_ms = 0.0
         self._play_start_ms = 0
         self._paused = False
-        self.setMinimumHeight(148)
-        self.setMaximumHeight(158)
+        self.setMinimumHeight(128)
+        self.setMaximumHeight(138)
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -266,7 +266,6 @@ class AudioPreviewPanel(QWidget):
         controls.addWidget(self.time_label)
         controls.addWidget(self.selection_label)
 
-        layout.addWidget(self.info_label)
         layout.addWidget(self.waveform)
         layout.addLayout(controls)
 
@@ -700,7 +699,7 @@ class VoiceCloneWidget(QWidget):
         layout.addWidget(choose_btn, 0, 3)
         layout.addWidget(QLabel("预览裁剪"), 1, 0)
         layout.addWidget(self.prepare_preview, 1, 1, 1, 3)
-        layout.setRowMinimumHeight(1, 150)
+        layout.setRowMinimumHeight(1, 132)
         self._row("截取参数", trim_box, 2, layout)
         layout.addWidget(self.prepare_btn, 3, 1)
         layout.addWidget(self.prepare_progress, 3, 2, 1, 2)
@@ -746,7 +745,7 @@ class VoiceCloneWidget(QWidget):
         layout.addWidget(choose_ref_btn, 0, 3)
         layout.addWidget(QLabel("预览裁剪"), 1, 0)
         layout.addWidget(self.clone_preview, 1, 1, 1, 3)
-        layout.setRowMinimumHeight(1, 150)
+        layout.setRowMinimumHeight(1, 132)
         layout.addWidget(QLabel("生成文本"), 2, 0)
         layout.addWidget(self.clone_text, 2, 1, 1, 3)
         self._row("风格提示词", self.clone_prompt, 3, layout)
@@ -791,10 +790,8 @@ class VoiceCloneWidget(QWidget):
         open_btn = QPushButton("打开输出目录")
         listen_btn.clicked.connect(lambda: self.listen_audio(self.ultimate_output.text()))
         open_btn.clicked.connect(self.open_output)
-        self.ultimate_transcribe_status = QLabel("选择参考音频后自动识别文字稿。")
+        self.ultimate_transcribe_status = QLabel("")
         self.ultimate_transcribe_status.setObjectName("mutedText")
-        self.ultimate_transcribe_status.setWordWrap(True)
-        self.ultimate_transcribe_status.setMinimumHeight(34)
 
         tip = QLabel("高相似克隆会自动识别参考音频文字稿，但建议生成前人工快速校对一次，文字稿越准，相似度越稳定。")
         tip.setObjectName("mutedText")
@@ -806,25 +803,22 @@ class VoiceCloneWidget(QWidget):
         layout.addWidget(transcribe_btn, 0, 3)
         layout.addWidget(QLabel("参考音频预览"), 1, 0)
         layout.addWidget(self.ultimate_preview, 1, 1, 1, 3)
-        layout.setRowMinimumHeight(1, 150)
-        layout.addWidget(QLabel("识别状态"), 2, 0)
-        layout.addWidget(self.ultimate_transcribe_status, 2, 1, 1, 3)
-        layout.setRowMinimumHeight(2, 34)
-        layout.addWidget(QLabel("参考音频文字稿"), 3, 0)
-        layout.addWidget(self.ultimate_transcript, 3, 1, 1, 3)
-        layout.setRowMinimumHeight(3, 92)
-        layout.addWidget(QLabel("生成文本"), 4, 0)
-        layout.addWidget(self.ultimate_text, 4, 1, 1, 3)
-        layout.setRowMinimumHeight(4, 78)
-        self._row("推理参数", param_box, 5, layout)
-        self._row("高级选项", advanced_box, 6, layout)
-        layout.addWidget(self.ultimate_generate_btn, 7, 1)
-        layout.addWidget(self.ultimate_progress, 7, 2, 1, 2)
-        self._row("输出文件", self.ultimate_output, 8, layout)
-        layout.addWidget(listen_btn, 8, 2)
-        layout.addWidget(open_btn, 8, 3)
-        layout.addWidget(tip, 9, 1, 1, 3)
-        layout.setRowStretch(10, 1)
+        layout.setRowMinimumHeight(1, 132)
+        layout.addWidget(QLabel("参考音频文字稿"), 2, 0)
+        layout.addWidget(self.ultimate_transcript, 2, 1, 1, 3)
+        layout.setRowMinimumHeight(2, 92)
+        layout.addWidget(QLabel("生成文本"), 3, 0)
+        layout.addWidget(self.ultimate_text, 3, 1, 1, 3)
+        layout.setRowMinimumHeight(3, 78)
+        self._row("推理参数", param_box, 4, layout)
+        self._row("高级选项", advanced_box, 5, layout)
+        layout.addWidget(self.ultimate_generate_btn, 6, 1)
+        layout.addWidget(self.ultimate_progress, 6, 2, 1, 2)
+        self._row("输出文件", self.ultimate_output, 7, layout)
+        layout.addWidget(listen_btn, 7, 2)
+        layout.addWidget(open_btn, 7, 3)
+        layout.addWidget(tip, 8, 1, 1, 3)
+        layout.setRowStretch(9, 1)
         return page
 
     def _build_batch_tab(self):
@@ -866,7 +860,7 @@ class VoiceCloneWidget(QWidget):
         layout.addWidget(ref_btn, 1, 2)
         layout.addWidget(QLabel("预览裁剪"), 2, 0)
         layout.addWidget(self.batch_preview, 2, 1, 1, 3)
-        layout.setRowMinimumHeight(2, 150)
+        layout.setRowMinimumHeight(2, 132)
         layout.addWidget(QLabel("输出目录"), 3, 0)
         layout.addWidget(self.batch_output_dir, 3, 1)
         layout.addWidget(output_btn, 3, 2)
@@ -1005,7 +999,10 @@ class VoiceCloneWidget(QWidget):
             self.prepare_preview.set_selection_seconds(self.prepare_start.value(), self.prepare_duration.value())
 
     def on_ultimate_preview_selection_changed(self, start, duration):
-        self.ultimate_transcribe_status.setText("参考音频选区已变化，请点击“重新识别文字稿”后再生成高相似克隆。")
+        message = "参考音频选区已变化，请点击上方“重新识别文字稿”后再生成。"
+        self.ultimate_transcribe_status.setText(message)
+        if not self.ultimate_transcript.toPlainText().strip():
+            self.ultimate_transcript.setPlaceholderText(message)
 
     def _ffmpeg_path(self):
         bundled = os.path.join(tools_dir(), "ffmpeg.exe")
@@ -1039,8 +1036,9 @@ class VoiceCloneWidget(QWidget):
         except Exception as exc:
             QMessageBox.warning(self, "裁剪失败", f"参考音频选区裁剪失败：{exc}")
             return
-        self.ultimate_transcribe_status.setText("正在自动识别参考音频文字稿...")
         self.ultimate_transcript.setPlainText("")
+        self.ultimate_transcript.setPlaceholderText("正在自动识别参考音频文字稿，请稍等...")
+        self.ultimate_transcribe_status.setText("正在自动识别参考音频文字稿...")
         self.transcribe_worker = ReferenceTranscribeWorker(
             audio_path,
             self.config.get("output_dir", OUTPUT_DIR),
@@ -1054,10 +1052,12 @@ class VoiceCloneWidget(QWidget):
     def on_ultimate_transcribe_finished(self, text):
         self.ultimate_progress.setValue(100)
         self.ultimate_transcript.setPlainText(text)
+        self.ultimate_transcript.setPlaceholderText("选择参考音频后会自动识别文字稿，识别完成后可在这里校对微调。")
         self.ultimate_transcribe_status.setText("文字稿已自动识别完成，可直接生成，也可以先校对微调。")
 
     def on_ultimate_transcribe_failed(self, message):
         self.ultimate_progress.setValue(0)
+        self.ultimate_transcript.setPlaceholderText(message)
         self.ultimate_transcribe_status.setText(message)
         QMessageBox.warning(self, "自动识别失败", message)
 
