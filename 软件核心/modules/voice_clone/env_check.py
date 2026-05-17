@@ -10,7 +10,7 @@ import time
 from packaging.version import Version, InvalidVersion
 
 from paths import tools_dir
-from .config import ENV_REPORT_FILE, OUTPUT_DIR, ensure_dirs
+from .config import ENV_REPORT_FILE, OUTPUT_DIR, ZIPENHANCER_MODEL_DIR, ensure_dirs
 from .model_manager import check_model_path
 
 
@@ -246,6 +246,14 @@ def check_environment(model_path, output_dir=None):
         "" if model_ok else "请确认选择的是完整的 VoxCPM2 模型目录，不要只选择上一级文件夹。",
     ))
 
+    zipenhancer_ok = os.path.isdir(ZIPENHANCER_MODEL_DIR)
+    results.append(_result(
+        "ZipEnhancer 降噪模型是否存在",
+        "pass" if zipenhancer_ok else "warn",
+        ZIPENHANCER_MODEL_DIR if zipenhancer_ok else "未找到",
+        "" if zipenhancer_ok else "仅影响“参考音频降噪增强”开关；如需启用，请把模型放入网盘资源包/models/speech_zipenhancer_ans_multiloss_16k_base。",
+    ))
+
     writable, writable_msg = _output_writable(output_dir)
     results.append(_result(
         "用户工作区/输出/voice_clone 是否可写入",
@@ -293,6 +301,7 @@ def build_report(results, model_path, output_dir, gpu, model_files):
         "",
         "【模型与输出】",
         f"VoxCPM2 模型路径：{model_path}",
+        f"ZipEnhancer 降噪模型路径：{ZIPENHANCER_MODEL_DIR}",
         f"输出目录：{output_dir}",
         f"模型文件总数：{model_files.get('total_files', 0)}",
         f"配置文件数量：{len(model_files.get('config_files', []))}",

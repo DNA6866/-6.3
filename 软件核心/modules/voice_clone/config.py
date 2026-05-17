@@ -15,6 +15,7 @@ CONFIG_DIR = config_dir()
 OUTPUT_DIR = workspace_path('输出', 'voice_clone')
 MODEL_DIR = os.path.join(models_dir(), 'VoxCPM2')
 ASR_MODEL_DIR = os.path.join(models_dir(), 'SenseVoiceSmall')
+ZIPENHANCER_MODEL_DIR = os.path.join(models_dir(), 'speech_zipenhancer_ans_multiloss_16k_base')
 LOG_DIR = logs_dir()
 CONFIG_FILE = os.path.join(CONFIG_DIR, 'voice_clone_config.json')
 ENV_REPORT_FILE = os.path.join(LOG_DIR, 'voice_clone_env_report.txt')
@@ -23,6 +24,7 @@ ENV_REPORT_FILE = os.path.join(LOG_DIR, 'voice_clone_env_report.txt')
 DEFAULT_CONFIG = {
     "model_path": MODEL_DIR,
     "asr_model_path": ASR_MODEL_DIR,
+    "zipenhancer_model_path": ZIPENHANCER_MODEL_DIR,
     "output_dir": OUTPUT_DIR,
     "last_reference_audio": "",
     "default_cfg_value": 2.0,
@@ -54,7 +56,7 @@ def load_config():
         cfg["model_path"] = MODEL_DIR
     if not os.path.exists(cfg.get("asr_model_path", "")):
         cfg["asr_model_path"] = ASR_MODEL_DIR
-    for key in ("model_path", "asr_model_path", "output_dir"):
+    for key in ("model_path", "asr_model_path", "zipenhancer_model_path", "output_dir"):
         value = cfg.get(key, "")
         if value and not os.path.isabs(value):
             cfg[key] = os.path.abspath(os.path.join(APP_ROOT, value))

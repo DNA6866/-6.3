@@ -32,11 +32,55 @@ def convert_to_wav(ffmpeg_path, input_path, output_path, sample_rate=16000, mono
     return output_path
 
 
+def get_media_duration(ffprobe_path, input_path):
+    try:
+        res = subprocess.run(
+            [
+                ffprobe_path, "-v", "error",
+                "-show_entries", "format=duration",
+                "-of", "default=noprint_wrappers=1:nokey=1",
+                input_path,
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            encoding="utf-8",
+            errors="ignore",
+            startupinfo=hidden_startupinfo(),
+        )
+        return max(0.0, float((res.stdout or "0").strip()))
+    except Exception:
+        return 0.0
+
+
 def trim_audio(ffmpeg_path, input_path, output_path, start=0, duration=30):
     cmd = [
         ffmpeg_path, '-y', '-hide_banner', '-loglevel', 'error',
         '-ss', str(start), '-i', input_path, '-t', str(duration),
         '-ac', '1', '-ar', '16000', '-c:a', 'pcm_s16le', output_path
+    ]
+    subprocess.run(cmd, startupinfo=hidden_startupinfo(), check=True, capture_output=True)
+    return output_path
+
+
+def extract_audio_from_media(ffmpeg_path, input_path, output_path, start=0, duration=0, sample_rate=16000):
+    cmd = [ffmpeg_path, '-y', '-hide_banner', '-loglevel', 'error']
+    if float(start or 0) > 0:
+        cmd.extend(['-ss', str(start)])
+    cmd.extend(['-i', input_path])
+    if float(duration or 0) > 0:
+        cmd.extend(['-t', str(duration)])
+    cmd.extend(['-vn', '-ac', '1', '-ar', str(sample_rate), '-c:a', 'pcm_s16le', output_path])
+    subprocess.run(cmd, startupinfo=hidden_startupinfo(), check=True, capture_output=True)
+    return output_path
+
+
+def normalize_audio_loudness(ffmpeg_path, input_path, output_path, sample_rate=16000):
+    cmd = [
+        ffmpeg_path, '-y', '-hide_banner', '-loglevel', 'error',
+        '-i', input_path,
+        '-af', 'loudnorm=I=-18:TP=-1.5:LRA=11',
+        '-ac', '1', '-ar', str(sample_rate), '-c:a', 'pcm_s16le', output_path
     ]
     subprocess.run(cmd, startupinfo=hidden_startupinfo(), check=True, capture_output=True)
     return output_path
