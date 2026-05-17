@@ -1,6 +1,6 @@
 import os
 
-from PyQt5.QtCore import Qt, QElapsedTimer, QTimer, QUrl, pyqtSignal
+from PyQt5.QtCore import Qt, QTimer, QUrl, pyqtSignal
 from PyQt5.QtGui import QBrush, QColor, QPainter, QPen
 from PyQt5.QtMultimedia import QMediaContent, QMediaPlayer
 from PyQt5.QtWidgets import (
@@ -48,8 +48,11 @@ class ReferenceWaveform(QWidget):
         self.selection_start = 0.0
         self.selection_end = 1.0
         self._drag_anchor = None
+        self._drag_mode = ""
+        self._drag_start = 0.0
+        self._drag_end = 1.0
         self._dragging = False
-        self.setMinimumHeight(92)
+        self.setMinimumHeight(118)
         self.setMouseTracking(True)
 
     def set_peaks(self, peaks):
@@ -85,22 +88,63 @@ class ReferenceWaveform(QWidget):
             return 0.0
         return max(0.0, min(1.0, (x - rect.left()) / rect.width()))
 
+    def _edge_tolerance(self):
+        rect = self._wave_rect()
+        if rect.width() <= 0:
+            return 0.015
+        return max(0.012, min(0.035, 10 / rect.width()))
+
     def mousePressEvent(self, event):
         if event.button() != Qt.LeftButton:
             return super().mousePressEvent(event)
+        ratio = self._ratio_from_x(event.x())
+        tolerance = self._edge_tolerance()
         self._dragging = True
-        self._drag_anchor = self._ratio_from_x(event.x())
-        self.set_selection(self._drag_anchor, self._drag_anchor)
+        self._drag_anchor = ratio
+        self._drag_start = self.selection_start
+        self._drag_end = self.selection_end
+        if abs(ratio - self.selection_start) <= tolerance:
+            self._drag_mode = "resize_start"
+        elif abs(ratio - self.selection_end) <= tolerance:
+            self._drag_mode = "resize_end"
+        elif self.selection_start < ratio < self.selection_end:
+            self._drag_mode = "move"
+            self.setCursor(Qt.ClosedHandCursor)
+        else:
+            self._drag_mode = "create"
+            self.set_selection(ratio, ratio)
 
     def mouseMoveEvent(self, event):
+        ratio = self._ratio_from_x(event.x())
         if self._dragging and self._drag_anchor is not None:
-            self.set_selection(self._drag_anchor, self._ratio_from_x(event.x()))
+            if self._drag_mode == "move":
+                width = max(0.002, self._drag_end - self._drag_start)
+                new_start = self._drag_start + (ratio - self._drag_anchor)
+                new_start = max(0.0, min(1.0 - width, new_start))
+                self.set_selection(new_start, new_start + width)
+            elif self._drag_mode == "resize_start":
+                self.set_selection(ratio, self._drag_end)
+            elif self._drag_mode == "resize_end":
+                self.set_selection(self._drag_start, ratio)
+            else:
+                self.set_selection(self._drag_anchor, ratio)
+            return
+
+        tolerance = self._edge_tolerance()
+        if abs(ratio - self.selection_start) <= tolerance or abs(ratio - self.selection_end) <= tolerance:
+            self.setCursor(Qt.SizeHorCursor)
+        elif self.selection_start < ratio < self.selection_end:
+            self.setCursor(Qt.OpenHandCursor)
+        else:
+            self.setCursor(Qt.ArrowCursor)
 
     def mouseReleaseEvent(self, event):
         if event.button() == Qt.LeftButton and self._dragging:
+            self.mouseMoveEvent(event)
             self._dragging = False
-            self.set_selection(self._drag_anchor, self._ratio_from_x(event.x()))
             self._drag_anchor = None
+            self._drag_mode = ""
+            self.setCursor(Qt.ArrowCursor)
             return
         super().mouseReleaseEvent(event)
 
@@ -157,9 +201,8 @@ class AudioPreviewPanel(QWidget):
         super().__init__(parent)
         self.audio_path = ""
         self.duration_ms = 0
-        self._clock = QElapsedTimer()
-        self._clock_anchor = 0
         self._loop_selection = True
+        self.setMinimumHeight(176)
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -173,13 +216,13 @@ class AudioPreviewPanel(QWidget):
         self.waveform.selectionChanged.connect(self._on_waveform_selection_changed)
 
         self.player = QMediaPlayer(self)
-        self.player.setNotifyInterval(20)
+        self.player.setNotifyInterval(15)
         self.player.stateChanged.connect(self._on_state_changed)
         self.player.durationChanged.connect(self._on_duration_changed)
         self.player.positionChanged.connect(self._on_position_changed)
 
         self.timer = QTimer(self)
-        self.timer.setInterval(20)
+        self.timer.setInterval(15)
         self.timer.timeout.connect(self.refresh_preview)
 
         self.play_btn = QPushButton("播放选区")
@@ -285,8 +328,6 @@ class AudioPreviewPanel(QWidget):
 
     def _seek_and_anchor(self, position):
         position = max(0, min(int(position), self._duration_ms() or int(position)))
-        self._clock_anchor = position
-        self._clock.restart()
         self.player.setPosition(position)
         self.refresh_preview(position)
 
@@ -306,13 +347,10 @@ class AudioPreviewPanel(QWidget):
         self._refresh_selection_label()
 
     def _on_position_changed(self, position):
-        if self.player.state() != QMediaPlayer.PlayingState:
-            self.refresh_preview(position)
+        self.refresh_preview(position)
 
     def _on_state_changed(self, state):
         if state == QMediaPlayer.PlayingState:
-            self._clock_anchor = self.player.position()
-            self._clock.restart()
             self.timer.start()
             self.play_btn.setText("暂停")
             self.play_btn.setIcon(self.style().standardIcon(QStyle.SP_MediaPause))
@@ -325,10 +363,7 @@ class AudioPreviewPanel(QWidget):
     def refresh_preview(self, position=None):
         duration = self._duration_ms()
         if position is None:
-            if self.player.state() == QMediaPlayer.PlayingState and self._clock.isValid():
-                position = self._clock_anchor + self._clock.elapsed()
-            else:
-                position = self.player.position()
+            position = self.player.position()
         if duration > 0 and self.player.state() == QMediaPlayer.PlayingState:
             start_ms, end_ms = self._selection_ms()
             if self._loop_selection and end_ms > start_ms and position >= end_ms:
@@ -586,6 +621,7 @@ class VoiceCloneWidget(QWidget):
         layout.addWidget(choose_btn, 0, 3)
         layout.addWidget(QLabel("预览裁剪"), 1, 0)
         layout.addWidget(self.prepare_preview, 1, 1, 1, 3)
+        layout.setRowMinimumHeight(1, 176)
         self._row("截取参数", trim_box, 2, layout)
         layout.addWidget(self.prepare_btn, 3, 1)
         layout.addWidget(self.prepare_progress, 3, 2, 1, 2)
@@ -631,6 +667,7 @@ class VoiceCloneWidget(QWidget):
         layout.addWidget(choose_ref_btn, 0, 3)
         layout.addWidget(QLabel("预览裁剪"), 1, 0)
         layout.addWidget(self.clone_preview, 1, 1, 1, 3)
+        layout.setRowMinimumHeight(1, 176)
         layout.addWidget(QLabel("生成文本"), 2, 0)
         layout.addWidget(self.clone_text, 2, 1, 1, 3)
         self._row("风格提示词", self.clone_prompt, 3, layout)
@@ -684,6 +721,7 @@ class VoiceCloneWidget(QWidget):
         layout.addWidget(transcribe_btn, 0, 3)
         layout.addWidget(QLabel("参考音频预览"), 1, 0)
         layout.addWidget(self.ultimate_preview, 1, 1, 1, 3)
+        layout.setRowMinimumHeight(1, 176)
         layout.addWidget(QLabel("识别状态"), 2, 0)
         layout.addWidget(self.ultimate_transcribe_status, 2, 1, 1, 3)
         layout.addWidget(QLabel("参考音频文字稿"), 3, 0)
@@ -738,6 +776,7 @@ class VoiceCloneWidget(QWidget):
         layout.addWidget(ref_btn, 1, 2)
         layout.addWidget(QLabel("预览裁剪"), 2, 0)
         layout.addWidget(self.batch_preview, 2, 1, 1, 3)
+        layout.setRowMinimumHeight(2, 176)
         layout.addWidget(QLabel("输出目录"), 3, 0)
         layout.addWidget(self.batch_output_dir, 3, 1)
         layout.addWidget(output_btn, 3, 2)
