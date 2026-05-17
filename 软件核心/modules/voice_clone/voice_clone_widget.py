@@ -53,7 +53,8 @@ class ReferenceWaveform(QWidget):
         self._drag_start = 0.0
         self._drag_end = 1.0
         self._dragging = False
-        self.setMinimumHeight(118)
+        self.setMinimumHeight(88)
+        self.setMaximumHeight(96)
         self.setMouseTracking(True)
 
     def set_peaks(self, peaks):
@@ -79,6 +80,10 @@ class ReferenceWaveform(QWidget):
         self.update()
         if emit and changed:
             self.selectionChanged.emit(self.selection_start, self.selection_end)
+
+    def has_custom_selection(self):
+        """全选是默认状态，不按蓝色框选样式绘制，避免误以为已经裁剪。"""
+        return self.selection_start > 0.003 or self.selection_end < 0.997
 
     def _wave_rect(self):
         return self.rect().adjusted(8, 8, -8, -8)
@@ -111,11 +116,12 @@ class ReferenceWaveform(QWidget):
         self._drag_anchor = ratio
         self._drag_start = self.selection_start
         self._drag_end = self.selection_end
-        if abs(ratio - self.selection_start) <= tolerance:
+        custom_selection = self.has_custom_selection()
+        if custom_selection and abs(ratio - self.selection_start) <= tolerance:
             self._drag_mode = "resize_start"
-        elif abs(ratio - self.selection_end) <= tolerance:
+        elif custom_selection and abs(ratio - self.selection_end) <= tolerance:
             self._drag_mode = "resize_end"
-        elif self.selection_start < ratio < self.selection_end:
+        elif custom_selection and self.selection_start < ratio < self.selection_end:
             self._drag_mode = "move"
             self.setCursor(Qt.ClosedHandCursor)
         else:
@@ -139,9 +145,10 @@ class ReferenceWaveform(QWidget):
             return
 
         tolerance = self._edge_tolerance()
-        if abs(ratio - self.selection_start) <= tolerance or abs(ratio - self.selection_end) <= tolerance:
+        custom_selection = self.has_custom_selection()
+        if custom_selection and (abs(ratio - self.selection_start) <= tolerance or abs(ratio - self.selection_end) <= tolerance):
             self.setCursor(Qt.SizeHorCursor)
-        elif self.selection_start < ratio < self.selection_end:
+        elif custom_selection and self.selection_start < ratio < self.selection_end:
             self.setCursor(Qt.OpenHandCursor)
         else:
             self.setCursor(Qt.ArrowCursor)
@@ -165,11 +172,13 @@ class ReferenceWaveform(QWidget):
         painter.setBrush(QBrush(QColor("#020617")))
         painter.drawRoundedRect(rect, 8, 8)
 
+        custom_selection = self.has_custom_selection()
         sel_left = track.left() + int(track.width() * self.selection_start)
         sel_right = track.left() + int(track.width() * self.selection_end)
-        painter.setPen(QPen(QColor("#38BDF8"), 1))
-        painter.setBrush(QBrush(QColor(37, 99, 235, 70)))
-        painter.drawRoundedRect(sel_left, rect.top() + 4, max(2, sel_right - sel_left), rect.height() - 8, 6, 6)
+        if custom_selection:
+            painter.setPen(QPen(QColor("#38BDF8"), 1))
+            painter.setBrush(QBrush(QColor(37, 99, 235, 70)))
+            painter.drawRoundedRect(sel_left, rect.top() + 4, max(2, sel_right - sel_left), rect.height() - 8, 6, 6)
 
         mid = rect.center().y()
         available_h = max(12, rect.height() - 18)
@@ -181,7 +190,7 @@ class ReferenceWaveform(QWidget):
                 peak = self.peaks[int(i * step)]
                 bar_h = max(2, int(peak * available_h))
                 ratio = i / max(1, count - 1)
-                if self.selection_start <= ratio <= self.selection_end:
+                if custom_selection and self.selection_start <= ratio <= self.selection_end:
                     color = QColor("#38BDF8")
                 elif ratio <= self.progress:
                     color = QColor("#93C5FD")
@@ -196,9 +205,10 @@ class ReferenceWaveform(QWidget):
         play_x = track.left() + int(track.width() * self.progress)
         painter.setPen(QPen(QColor("#FDE68A"), 2))
         painter.drawLine(play_x, rect.top() + 8, play_x, rect.bottom() - 8)
-        painter.setPen(QPen(QColor("#FDE68A"), 2))
-        painter.drawLine(sel_left, rect.top() + 6, sel_left, rect.bottom() - 6)
-        painter.drawLine(sel_right, rect.top() + 6, sel_right, rect.bottom() - 6)
+        if custom_selection:
+            painter.setPen(QPen(QColor("#FDE68A"), 2))
+            painter.drawLine(sel_left, rect.top() + 6, sel_left, rect.bottom() - 6)
+            painter.drawLine(sel_right, rect.top() + 6, sel_right, rect.bottom() - 6)
 
 
 class AudioPreviewPanel(QWidget):
@@ -218,16 +228,18 @@ class AudioPreviewPanel(QWidget):
         self._audio_bytes_per_ms = 0.0
         self._play_start_ms = 0
         self._paused = False
-        self.setMinimumHeight(176)
+        self.setMinimumHeight(148)
+        self.setMaximumHeight(158)
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(8)
+        layout.setSpacing(5)
 
         self.title_label = QLabel(title)
         self.title_label.setObjectName("mutedText")
         self.info_label = QLabel("尚未选择音频")
         self.info_label.setObjectName("mutedText")
+        self.info_label.setMaximumHeight(20)
         self.waveform = ReferenceWaveform()
         self.waveform.selectionChanged.connect(self._on_waveform_selection_changed)
 
@@ -250,11 +262,10 @@ class AudioPreviewPanel(QWidget):
         controls.setContentsMargins(0, 0, 0, 0)
         controls.addWidget(self.play_btn)
         controls.addWidget(self.stop_btn)
+        controls.addStretch(1)
         controls.addWidget(self.time_label)
         controls.addWidget(self.selection_label)
-        controls.addStretch(1)
 
-        layout.addWidget(self.title_label)
         layout.addWidget(self.info_label)
         layout.addWidget(self.waveform)
         layout.addLayout(controls)
@@ -689,7 +700,7 @@ class VoiceCloneWidget(QWidget):
         layout.addWidget(choose_btn, 0, 3)
         layout.addWidget(QLabel("预览裁剪"), 1, 0)
         layout.addWidget(self.prepare_preview, 1, 1, 1, 3)
-        layout.setRowMinimumHeight(1, 176)
+        layout.setRowMinimumHeight(1, 150)
         self._row("截取参数", trim_box, 2, layout)
         layout.addWidget(self.prepare_btn, 3, 1)
         layout.addWidget(self.prepare_progress, 3, 2, 1, 2)
@@ -735,7 +746,7 @@ class VoiceCloneWidget(QWidget):
         layout.addWidget(choose_ref_btn, 0, 3)
         layout.addWidget(QLabel("预览裁剪"), 1, 0)
         layout.addWidget(self.clone_preview, 1, 1, 1, 3)
-        layout.setRowMinimumHeight(1, 176)
+        layout.setRowMinimumHeight(1, 150)
         layout.addWidget(QLabel("生成文本"), 2, 0)
         layout.addWidget(self.clone_text, 2, 1, 1, 3)
         self._row("风格提示词", self.clone_prompt, 3, layout)
@@ -763,10 +774,12 @@ class VoiceCloneWidget(QWidget):
         self.ultimate_preview.selectionChanged.connect(self.on_ultimate_preview_selection_changed)
         self.ultimate_transcript = QTextEdit()
         self.ultimate_transcript.setPlaceholderText("选择参考音频后会自动识别文字稿，识别完成后可在这里校对微调。")
-        self.ultimate_transcript.setMinimumHeight(104)
+        self.ultimate_transcript.setMinimumHeight(86)
+        self.ultimate_transcript.setMaximumHeight(110)
         self.ultimate_text = QTextEdit()
         self.ultimate_text.setPlaceholderText("输入要生成的新文本")
-        self.ultimate_text.setMinimumHeight(86)
+        self.ultimate_text.setMinimumHeight(72)
+        self.ultimate_text.setMaximumHeight(92)
         param_box, self.ultimate_cfg, self.ultimate_steps = self._build_param_line()
         advanced_box, self.ultimate_normalize, self.ultimate_denoise = self._build_advanced_line(denoise=True)
         self.ultimate_generate_btn = QPushButton("生成高相似克隆")
@@ -793,16 +806,16 @@ class VoiceCloneWidget(QWidget):
         layout.addWidget(transcribe_btn, 0, 3)
         layout.addWidget(QLabel("参考音频预览"), 1, 0)
         layout.addWidget(self.ultimate_preview, 1, 1, 1, 3)
-        layout.setRowMinimumHeight(1, 176)
+        layout.setRowMinimumHeight(1, 150)
         layout.addWidget(QLabel("识别状态"), 2, 0)
         layout.addWidget(self.ultimate_transcribe_status, 2, 1, 1, 3)
-        layout.setRowMinimumHeight(2, 40)
+        layout.setRowMinimumHeight(2, 34)
         layout.addWidget(QLabel("参考音频文字稿"), 3, 0)
         layout.addWidget(self.ultimate_transcript, 3, 1, 1, 3)
-        layout.setRowMinimumHeight(3, 112)
+        layout.setRowMinimumHeight(3, 92)
         layout.addWidget(QLabel("生成文本"), 4, 0)
         layout.addWidget(self.ultimate_text, 4, 1, 1, 3)
-        layout.setRowMinimumHeight(4, 94)
+        layout.setRowMinimumHeight(4, 78)
         self._row("推理参数", param_box, 5, layout)
         self._row("高级选项", advanced_box, 6, layout)
         layout.addWidget(self.ultimate_generate_btn, 7, 1)
@@ -835,6 +848,8 @@ class VoiceCloneWidget(QWidget):
         self.batch_prompt.setPlaceholderText("无参考音频时作为声音描述；有参考音频时作为风格提示词")
         self.batch_prompt_text = QTextEdit()
         self.batch_prompt_text.setPlaceholderText("可选：填写参考音频文字稿后使用高相似批量克隆；为空则使用普通参考音频克隆。")
+        self.batch_prompt_text.setMinimumHeight(72)
+        self.batch_prompt_text.setMaximumHeight(94)
         param_box, self.batch_cfg, self.batch_steps = self._build_param_line()
         advanced_box, self.batch_normalize, self.batch_denoise = self._build_advanced_line(denoise=True)
         start_btn = QPushButton("开始批量生成")
@@ -851,7 +866,7 @@ class VoiceCloneWidget(QWidget):
         layout.addWidget(ref_btn, 1, 2)
         layout.addWidget(QLabel("预览裁剪"), 2, 0)
         layout.addWidget(self.batch_preview, 2, 1, 1, 3)
-        layout.setRowMinimumHeight(2, 176)
+        layout.setRowMinimumHeight(2, 150)
         layout.addWidget(QLabel("输出目录"), 3, 0)
         layout.addWidget(self.batch_output_dir, 3, 1)
         layout.addWidget(output_btn, 3, 2)
