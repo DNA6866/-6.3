@@ -159,6 +159,13 @@ def check_environment(model_path, output_dir=None):
     ))
 
     py_version = ".".join(str(x) for x in sys.version_info[:3])
+    runtime_path = sys.executable
+    results.append(_result(
+        "当前软件实际使用的 Python/EXE",
+        "pass",
+        runtime_path,
+        "音频克隆检测的是牛爷爷软件当前运行环境，不会自动复用 ComfyUI 的 Python 环境。",
+    ))
     py_ok = sys.version_info >= (3, 10) and sys.version_info < (3, 13)
     results.append(_result(
         "Python 版本是否满足 >=3.10 且 <3.13",
@@ -173,7 +180,7 @@ def check_environment(model_path, output_dir=None):
         "是否安装 torch",
         "pass" if torch_ok else "fail",
         torch_version if torch_ok else "未安装",
-        "" if torch_ok else "当前环境未安装 PyTorch，请安装适配显卡的 PyTorch GPU 版本。",
+        "" if torch_ok else "当前软件运行环境未安装 PyTorch。ComfyUI 已安装不代表本软件环境已安装，请给牛爷爷软件环境安装适配显卡的 PyTorch GPU 版本。",
     ))
     results.append(_result(
         "torch 版本是否 >=2.5.0",
@@ -195,7 +202,7 @@ def check_environment(model_path, output_dir=None):
         "torch.cuda.is_available() 是否为 True",
         "pass" if cuda_available else "fail",
         str(cuda_available),
-        "" if cuda_available else "当前 PyTorch 无法调用 GPU，可能安装成了 CPU 版本。",
+        "" if cuda_available else "当前软件运行环境里的 PyTorch 无法调用 GPU，可能安装成了 CPU 版本；这和 ComfyUI 能否运行不是同一个环境。",
     ))
     results.append(_result(
         "CUDA 是否可用",
@@ -214,7 +221,7 @@ def check_environment(model_path, output_dir=None):
             label,
             "pass" if ok else "fail",
             version_or_error if ok else "不可用",
-            "" if ok else f"当前环境缺少 {module_name}，请安装依赖后重试。",
+            "" if ok else f"当前软件运行环境缺少 {module_name}。如果 ComfyUI 里有这个库，也不会自动给本软件使用，请安装到牛爷爷软件的运行环境中。",
         ))
 
     ffmpeg = _find_ffmpeg()
@@ -274,6 +281,8 @@ def build_report(results, model_path, output_dir, gpu, model_files):
         "",
         "【系统信息】",
         f"系统信息：{platform.platform()}",
+        f"当前软件运行环境：{sys.executable}",
+        "说明：AI音频克隆检测的是牛爷爷软件当前运行环境，不会自动复用 ComfyUI 的 Python/venv。",
         f"Python 版本：{'.'.join(str(x) for x in sys.version_info[:3])}",
         "",
         "【显卡信息】",
