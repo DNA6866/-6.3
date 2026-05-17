@@ -1,6 +1,6 @@
 import os
 
-from PyQt5.QtCore import Qt, QUrl
+from PyQt5.QtCore import Qt, QTimer, QUrl
 from PyQt5.QtGui import QBrush, QColor, QPainter, QPen
 from PyQt5.QtMultimedia import QMediaContent, QMediaPlayer
 from PyQt5.QtWidgets import (
@@ -95,6 +95,9 @@ class VoiceCloneWidget(QWidget):
         self.audio_prepare_worker = None
         self.batch_worker = None
         self.ultimate_player = None
+        self.ultimate_preview_timer = QTimer(self)
+        self.ultimate_preview_timer.setInterval(40)
+        self.ultimate_preview_timer.timeout.connect(self.refresh_ultimate_playback_preview)
         self._build_ui()
         self._load_config_to_ui()
 
@@ -584,6 +587,7 @@ class VoiceCloneWidget(QWidget):
         if self.ultimate_player:
             return
         self.ultimate_player = QMediaPlayer(self)
+        self.ultimate_player.setNotifyInterval(40)
         self.ultimate_player.positionChanged.connect(self.on_ultimate_position_changed)
         self.ultimate_player.durationChanged.connect(self.on_ultimate_duration_changed)
         self.ultimate_player.stateChanged.connect(self.on_ultimate_player_state_changed)
@@ -615,15 +619,24 @@ class VoiceCloneWidget(QWidget):
             self.ultimate_player.pause()
         else:
             self.ultimate_player.play()
+            self.refresh_ultimate_playback_preview()
 
     def stop_ultimate_reference_playback(self):
         if self.ultimate_player:
             self.ultimate_player.stop()
+        self.ultimate_preview_timer.stop()
         if hasattr(self, "ultimate_waveform"):
             self.ultimate_waveform.set_progress(0)
 
     def on_ultimate_position_changed(self, position):
-        duration = self.ultimate_player.duration() if self.ultimate_player else 0
+        self.refresh_ultimate_playback_preview(position)
+
+    def refresh_ultimate_playback_preview(self, position=None):
+        if not self.ultimate_player:
+            return
+        if position is None:
+            position = self.ultimate_player.position()
+        duration = self.ultimate_player.duration()
         if duration > 0:
             self.ultimate_waveform.set_progress(position / duration)
         self.ultimate_position_label.setText(f"{self._fmt_ms(position)} / {self._fmt_ms(duration)}")
@@ -636,9 +649,13 @@ class VoiceCloneWidget(QWidget):
         if state == QMediaPlayer.PlayingState:
             self.ultimate_play_btn.setText("暂停")
             self.ultimate_play_btn.setIcon(self.style().standardIcon(QStyle.SP_MediaPause))
+            if not self.ultimate_preview_timer.isActive():
+                self.ultimate_preview_timer.start()
         else:
             self.ultimate_play_btn.setText("播放")
             self.ultimate_play_btn.setIcon(self.style().standardIcon(QStyle.SP_MediaPlay))
+            self.ultimate_preview_timer.stop()
+            self.refresh_ultimate_playback_preview()
 
     def _fmt_ms(self, value):
         total = max(0, int(value // 1000))
