@@ -448,6 +448,29 @@ QCheckBox {
     spacing: 6px;
 }
 
+QCheckBox::indicator {
+    width: 18px;
+    height: 18px;
+    border-radius: 5px;
+    border: 2px solid #94A3B8;
+    background: #020617;
+}
+
+QCheckBox::indicator:hover {
+    border-color: #60A5FA;
+}
+
+QCheckBox::indicator:checked {
+    background: #2563EB;
+    border-color: #FDE68A;
+    image: none;
+}
+
+QCheckBox::indicator:checked:disabled {
+    background: #334155;
+    border-color: #64748B;
+}
+
 QProgressBar {
     background: #0F1724;
     border: 1px solid #334155;
