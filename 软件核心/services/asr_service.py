@@ -17,6 +17,49 @@ def hidden_startupinfo():
     return startupinfo
 
 
+def _is_ascii_path(path):
+    try:
+        str(path).encode("ascii")
+        return True
+    except Exception:
+        return False
+
+
+def _subst_ascii_dir(path):
+    """SenseVoice 底层在 Windows 下可能读不到中文模型路径，临时映射成纯英文盘符。"""
+    if os.name != "nt" or not path or _is_ascii_path(path):
+        return path, ""
+    abs_path = os.path.abspath(path)
+    if not os.path.isdir(abs_path):
+        return path, ""
+    for letter in "ZYXWVUTSRQPONMLKJIHGFEDCBA":
+        drive = f"{letter}:"
+        if os.path.exists(drive + "\\"):
+            continue
+        result = subprocess.run(
+            ["subst", drive, abs_path],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            errors="ignore",
+            startupinfo=hidden_startupinfo(),
+        )
+        if result.returncode == 0:
+            return drive + "\\", drive
+    return path, ""
+
+
+def _release_subst_drive(drive):
+    if os.name == "nt" and drive:
+        subprocess.run(
+            ["subst", drive, "/D"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            startupinfo=hidden_startupinfo(),
+        )
+
+
 def clean_asr_text(text):
     text = re.sub(r"<\|[^>]+?\|>", "", text or "")
     text = re.sub(r"\s+", " ", text)
@@ -53,12 +96,16 @@ def preload_sensevoice_model(model_path):
         if not was_loaded:
             from funasr import AutoModel
 
-            _SENSEVOICE_MODEL = AutoModel(
-                model=model_path,
-                trust_remote_code=False,
-                disable_update=True,
-                device=device,
-            )
+            safe_model_path, subst_drive = _subst_ascii_dir(model_path)
+            try:
+                _SENSEVOICE_MODEL = AutoModel(
+                    model=safe_model_path,
+                    trust_remote_code=False,
+                    disable_update=True,
+                    device=device,
+                )
+            finally:
+                _release_subst_drive(subst_drive)
             _SENSEVOICE_MODEL_PATH = os.path.abspath(model_path)
             _SENSEVOICE_DEVICE = device
         return device, was_loaded
