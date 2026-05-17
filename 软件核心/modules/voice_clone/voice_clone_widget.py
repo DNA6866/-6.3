@@ -1,8 +1,9 @@
 import os
+import wave
 
-from PyQt5.QtCore import Qt, QTimer, QUrl, pyqtSignal
+from PyQt5.QtCore import QByteArray, QBuffer, QIODevice, Qt, QTimer, pyqtSignal
 from PyQt5.QtGui import QBrush, QColor, QPainter, QPen
-from PyQt5.QtMultimedia import QMediaContent, QMediaPlayer
+from PyQt5.QtMultimedia import QAudio, QAudioDeviceInfo, QAudioFormat, QAudioOutput
 from PyQt5.QtWidgets import (
     QFileDialog,
     QDoubleSpinBox,
@@ -200,8 +201,15 @@ class AudioPreviewPanel(QWidget):
     def __init__(self, title="参考音频预览", parent=None):
         super().__init__(parent)
         self.audio_path = ""
+        self.preview_wav_path = ""
         self.duration_ms = 0
         self._loop_selection = True
+        self._audio_output = None
+        self._audio_buffer = None
+        self._audio_data = QByteArray()
+        self._audio_bytes_per_ms = 0.0
+        self._play_start_ms = 0
+        self._paused = False
         self.setMinimumHeight(176)
 
         layout = QVBoxLayout(self)
@@ -214,12 +222,6 @@ class AudioPreviewPanel(QWidget):
         self.info_label.setObjectName("mutedText")
         self.waveform = ReferenceWaveform()
         self.waveform.selectionChanged.connect(self._on_waveform_selection_changed)
-
-        self.player = QMediaPlayer(self)
-        self.player.setNotifyInterval(15)
-        self.player.stateChanged.connect(self._on_state_changed)
-        self.player.durationChanged.connect(self._on_duration_changed)
-        self.player.positionChanged.connect(self._on_position_changed)
 
         self.timer = QTimer(self)
         self.timer.setInterval(15)
@@ -252,7 +254,10 @@ class AudioPreviewPanel(QWidget):
     def set_audio(self, audio_path):
         self.stop()
         self.audio_path = audio_path or ""
+        self.preview_wav_path = ""
         self.duration_ms = 0
+        self._audio_data = QByteArray()
+        self._audio_bytes_per_ms = 0.0
         self.waveform.set_peaks([])
         self.waveform.set_progress(0)
         if not self.audio_path or not os.path.exists(self.audio_path):
@@ -260,13 +265,13 @@ class AudioPreviewPanel(QWidget):
             self.time_label.setText("00:00 / 00:00")
             self.selection_label.setText("选区：全部")
             return
-        self.player.setMedia(QMediaContent(QUrl.fromLocalFile(os.path.abspath(self.audio_path))))
         name = os.path.basename(self.audio_path)
         size_mb = os.path.getsize(self.audio_path) / 1024 / 1024
         ffprobe = os.path.join(tools_dir(), "ffprobe.exe")
         duration = get_media_duration(ffprobe if os.path.exists(ffprobe) else "ffprobe", self.audio_path)
         if duration > 0:
             self.duration_ms = int(duration * 1000)
+        self._prepare_pcm_preview()
         self.info_label.setText(f"{name}    {size_mb:.2f} MB")
         self._refresh_selection_label()
         self.refresh_preview(0)
@@ -300,18 +305,37 @@ class AudioPreviewPanel(QWidget):
     def toggle_playback(self):
         if not self.has_audio():
             return
-        if self.player.state() == QMediaPlayer.PlayingState:
-            self.player.pause()
+        if self._audio_output and self._audio_output.state() == QAudio.ActiveState:
+            self._audio_output.suspend()
+            self._paused = True
+            self.timer.stop()
+            self.play_btn.setText("继续")
+            self.play_btn.setIcon(self.style().standardIcon(QStyle.SP_MediaPlay))
+            return
+        if self._audio_output and self._audio_output.state() == QAudio.SuspendedState:
+            self._paused = False
+            self._audio_output.resume()
+            self.timer.start()
+            self.play_btn.setText("暂停")
+            self.play_btn.setIcon(self.style().standardIcon(QStyle.SP_MediaPause))
             return
         start_ms, _ = self._selection_ms()
-        self._seek_and_anchor(start_ms)
-        self.player.play()
+        self._start_audio_output(start_ms)
 
     def stop(self):
         self.timer.stop()
-        self.player.stop()
-        self._seek_and_anchor(0)
+        if self._audio_output:
+            self._audio_output.stop()
+            self._audio_output.deleteLater()
+            self._audio_output = None
+        if self._audio_buffer:
+            self._audio_buffer.close()
+            self._audio_buffer.deleteLater()
+            self._audio_buffer = None
+        self._play_start_ms = 0
+        self._paused = False
         self.waveform.set_progress(0)
+        self.time_label.setText(f"{self._fmt_ms(0)} / {self._fmt_ms(self._duration_ms())}")
         self.play_btn.setText("播放选区")
         self.play_btn.setIcon(self.style().standardIcon(QStyle.SP_MediaPlay))
 
@@ -324,50 +348,85 @@ class AudioPreviewPanel(QWidget):
         return start, end
 
     def _duration_ms(self):
-        return self.duration_ms or self.player.duration() or 0
+        return self.duration_ms or 0
 
-    def _seek_and_anchor(self, position):
-        position = max(0, min(int(position), self._duration_ms() or int(position)))
-        self.player.setPosition(position)
-        self.refresh_preview(position)
+    def _prepare_pcm_preview(self):
+        ffmpeg = os.path.join(tools_dir(), "ffmpeg.exe")
+        ffmpeg = ffmpeg if os.path.exists(ffmpeg) else "ffmpeg"
+        self.preview_wav_path = make_output_path(OUTPUT_DIR, "preview_audio", "wav")
+        extract_audio_from_media(ffmpeg, self.audio_path, self.preview_wav_path, start=0, duration=0, sample_rate=48000)
+        with wave.open(self.preview_wav_path, "rb") as wav_file:
+            channels = wav_file.getnchannels()
+            sample_width = wav_file.getsampwidth()
+            sample_rate = wav_file.getframerate()
+            frames = wav_file.getnframes()
+            pcm = wav_file.readframes(frames)
+        if sample_width != 2:
+            raise RuntimeError("预览音频格式不支持，请换用 wav/mp3/m4a 等常见格式。")
+        self._audio_data = QByteArray(pcm)
+        self._audio_bytes_per_ms = sample_rate * channels * sample_width / 1000
+        self.duration_ms = int(frames / sample_rate * 1000) if sample_rate else self.duration_ms
+        self._audio_format = QAudioFormat()
+        self._audio_format.setSampleRate(sample_rate)
+        self._audio_format.setChannelCount(channels)
+        self._audio_format.setSampleSize(sample_width * 8)
+        self._audio_format.setCodec("audio/pcm")
+        self._audio_format.setByteOrder(QAudioFormat.LittleEndian)
+        self._audio_format.setSampleType(QAudioFormat.SignedInt)
+        device = QAudioDeviceInfo.defaultOutputDevice()
+        if not device.isFormatSupported(self._audio_format):
+            self._audio_format = device.nearestFormat(self._audio_format)
+
+    def _start_audio_output(self, start_ms):
+        if self._audio_data.isEmpty():
+            self._prepare_pcm_preview()
+        self.stop()
+        start_ms = max(0, min(int(start_ms), self._duration_ms()))
+        byte_pos = int(start_ms * self._audio_bytes_per_ms)
+        if byte_pos % 2:
+            byte_pos -= 1
+        self._play_start_ms = start_ms
+        self._audio_buffer = QBuffer(self)
+        self._audio_buffer.setData(self._audio_data)
+        self._audio_buffer.open(QIODevice.ReadOnly)
+        self._audio_buffer.seek(max(0, min(byte_pos, self._audio_data.size())))
+        self._audio_output = QAudioOutput(self._audio_format, self)
+        self._audio_output.stateChanged.connect(self._on_audio_state_changed)
+        self._audio_output.start(self._audio_buffer)
+        self.timer.start()
+        self.play_btn.setText("暂停")
+        self.play_btn.setIcon(self.style().standardIcon(QStyle.SP_MediaPause))
+        self.refresh_preview(start_ms)
 
     def _on_waveform_selection_changed(self, start_ratio, end_ratio):
-        if self.player.state() == QMediaPlayer.PlayingState:
-            self.player.pause()
+        if self._audio_output and self._audio_output.state() == QAudio.ActiveState:
+            self._audio_output.suspend()
+            self._paused = True
+            self.timer.stop()
         start_ms, _ = self._selection_ms()
-        self._seek_and_anchor(start_ms)
+        self._play_start_ms = start_ms
+        self.refresh_preview(start_ms)
         self._refresh_selection_label()
         start, duration = self.selection_seconds()
         self.selectionChanged.emit(start, duration)
 
-    def _on_duration_changed(self, duration):
-        if duration > 0:
-            self.duration_ms = duration
-        self.refresh_preview()
-        self._refresh_selection_label()
-
-    def _on_position_changed(self, position):
-        self.refresh_preview(position)
-
-    def _on_state_changed(self, state):
-        if state == QMediaPlayer.PlayingState:
-            self.timer.start()
-            self.play_btn.setText("暂停")
-            self.play_btn.setIcon(self.style().standardIcon(QStyle.SP_MediaPause))
-        else:
+    def _on_audio_state_changed(self, state):
+        if state in (QAudio.IdleState, QAudio.StoppedState) and not self._paused:
             self.timer.stop()
-            self.refresh_preview()
             self.play_btn.setText("播放选区")
             self.play_btn.setIcon(self.style().standardIcon(QStyle.SP_MediaPlay))
 
     def refresh_preview(self, position=None):
         duration = self._duration_ms()
         if position is None:
-            position = self.player.position()
-        if duration > 0 and self.player.state() == QMediaPlayer.PlayingState:
+            if self._audio_output and self._audio_output.state() in (QAudio.ActiveState, QAudio.SuspendedState):
+                position = self._play_start_ms + int(self._audio_output.processedUSecs() / 1000)
+            else:
+                position = self._play_start_ms
+        if duration > 0 and self._audio_output and self._audio_output.state() == QAudio.ActiveState:
             start_ms, end_ms = self._selection_ms()
             if self._loop_selection and end_ms > start_ms and position >= end_ms:
-                self._seek_and_anchor(start_ms)
+                self._start_audio_output(start_ms)
                 return
         position = max(0, min(int(position or 0), duration or int(position or 0)))
         if duration > 0:
