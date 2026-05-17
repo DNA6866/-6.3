@@ -53,8 +53,7 @@ class ReferenceWaveform(QWidget):
         self._drag_start = 0.0
         self._drag_end = 1.0
         self._dragging = False
-        self.setMinimumHeight(88)
-        self.setMaximumHeight(96)
+        self.setFixedHeight(82)
         self.setMouseTracking(True)
 
     def set_peaks(self, peaks):
@@ -183,11 +182,13 @@ class ReferenceWaveform(QWidget):
         mid = rect.center().y()
         available_h = max(12, rect.height() - 18)
         if self.peaks:
-            count = min(max(1, track.width()), len(self.peaks))
+            # 波形点数量可能少于控件宽度，绘制时必须重新采样铺满整条轨道。
+            count = max(1, track.width())
             step = len(self.peaks) / max(1, count)
             for i in range(count):
                 x = track.left() + i
-                peak = self.peaks[int(i * step)]
+                peak_index = min(len(self.peaks) - 1, int(i * step))
+                peak = self.peaks[peak_index]
                 bar_h = max(2, int(peak * available_h))
                 ratio = i / max(1, count - 1)
                 if custom_selection and self.selection_start <= ratio <= self.selection_end:
@@ -228,8 +229,7 @@ class AudioPreviewPanel(QWidget):
         self._audio_bytes_per_ms = 0.0
         self._play_start_ms = 0
         self._paused = False
-        self.setMinimumHeight(128)
-        self.setMaximumHeight(138)
+        self.setFixedHeight(122)
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -249,9 +249,11 @@ class AudioPreviewPanel(QWidget):
 
         self.play_btn = QPushButton("播放选区")
         self.play_btn.setIcon(self.style().standardIcon(QStyle.SP_MediaPlay))
+        self.play_btn.setFixedHeight(28)
         self.play_btn.clicked.connect(self.toggle_playback)
         self.stop_btn = QPushButton("停止")
         self.stop_btn.setIcon(self.style().standardIcon(QStyle.SP_MediaStop))
+        self.stop_btn.setFixedHeight(28)
         self.stop_btn.clicked.connect(self.stop)
         self.time_label = QLabel("00:00 / 00:00")
         self.time_label.setObjectName("mutedText")
@@ -699,7 +701,7 @@ class VoiceCloneWidget(QWidget):
         layout.addWidget(choose_btn, 0, 3)
         layout.addWidget(QLabel("预览裁剪"), 1, 0)
         layout.addWidget(self.prepare_preview, 1, 1, 1, 3)
-        layout.setRowMinimumHeight(1, 132)
+        layout.setRowMinimumHeight(1, 126)
         self._row("截取参数", trim_box, 2, layout)
         layout.addWidget(self.prepare_btn, 3, 1)
         layout.addWidget(self.prepare_progress, 3, 2, 1, 2)
@@ -745,7 +747,7 @@ class VoiceCloneWidget(QWidget):
         layout.addWidget(choose_ref_btn, 0, 3)
         layout.addWidget(QLabel("预览裁剪"), 1, 0)
         layout.addWidget(self.clone_preview, 1, 1, 1, 3)
-        layout.setRowMinimumHeight(1, 132)
+        layout.setRowMinimumHeight(1, 126)
         layout.addWidget(QLabel("生成文本"), 2, 0)
         layout.addWidget(self.clone_text, 2, 1, 1, 3)
         self._row("风格提示词", self.clone_prompt, 3, layout)
@@ -803,7 +805,7 @@ class VoiceCloneWidget(QWidget):
         layout.addWidget(transcribe_btn, 0, 3)
         layout.addWidget(QLabel("参考音频预览"), 1, 0)
         layout.addWidget(self.ultimate_preview, 1, 1, 1, 3)
-        layout.setRowMinimumHeight(1, 132)
+        layout.setRowMinimumHeight(1, 126)
         layout.addWidget(QLabel("参考音频文字稿"), 2, 0)
         layout.addWidget(self.ultimate_transcript, 2, 1, 1, 3)
         layout.setRowMinimumHeight(2, 92)
@@ -824,6 +826,7 @@ class VoiceCloneWidget(QWidget):
     def _build_batch_tab(self):
         page = QWidget()
         layout = QGridLayout(page)
+        layout.setVerticalSpacing(8)
         layout.setColumnStretch(1, 1)
 
         self.batch_txt = QLineEdit()
@@ -860,7 +863,7 @@ class VoiceCloneWidget(QWidget):
         layout.addWidget(ref_btn, 1, 2)
         layout.addWidget(QLabel("预览裁剪"), 2, 0)
         layout.addWidget(self.batch_preview, 2, 1, 1, 3)
-        layout.setRowMinimumHeight(2, 132)
+        layout.setRowMinimumHeight(2, 126)
         layout.addWidget(QLabel("输出目录"), 3, 0)
         layout.addWidget(self.batch_output_dir, 3, 1)
         layout.addWidget(output_btn, 3, 2)
