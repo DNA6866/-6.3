@@ -532,12 +532,11 @@ class VideoMixerApp(QMainWindow):
     def __init__(self):
         super().__init__()
         os.chdir(APP_DIR)
-        self.tab_names = ['音频素材', '封面图片', '开头素材(段1)', '承接素材(段2)', '视频素材', '背景音乐', '智能字幕', '文字水印', '保存视频']
+        self.tab_names = ['音频素材', '封面图片', '第一轨道', '视频素材', '背景音乐', '智能字幕', '文字水印', '保存视频']
         self.tab_folders = {
             '音频素材': workspace_path('素材', '音频素材'),
             '封面图片': workspace_path('素材', '封面图片'),
-            '开头素材(段1)': workspace_path('素材', '开头素材(段1)'),
-            '承接素材(段2)': workspace_path('素材', '承接素材(段2)'),
+            '第一轨道': workspace_path('素材', '第一轨道'),
             '视频素材': workspace_path('素材', '视频素材'),
             '背景音乐': workspace_path('素材', '背景音乐'),
             '保存视频': workspace_path('输出', '保存视频'),
@@ -550,7 +549,7 @@ class VideoMixerApp(QMainWindow):
         
         self.tab_exts = {
             '音频素材': ['.mp3', '.wav', '.m4a'], '封面图片': ['.jpg', '.jpeg', '.png'], 
-            '开头素材(段1)': ['.mp4', '.mov'], '承接素材(段2)': ['.mp4', '.mov'], 
+            '第一轨道': ['.mp4', '.mov', '.avi', '.mkv'],
             '视频素材': ['.mp4', '.mov', '.avi'], '背景音乐': ['.mp3', '.wav'], 
             '保存视频': ['.mp4']
         }
@@ -699,8 +698,7 @@ class VideoMixerApp(QMainWindow):
                 'loop_count': self.loop_spin.value(), 'threads': self.thread_spin.value(),
                 'anti_dedup': self.anti_dedup_chk.isChecked(),
                 'auto_perf': self.auto_perf_chk.isChecked(),
-                'output_date_folder': self.output_date_folder_chk.isChecked() if hasattr(self, 'output_date_folder_chk') else True,
-                'mix_preset': self.mix_preset_combo.currentText() if hasattr(self, 'mix_preset_combo') else ''
+                'output_date_folder': True
             },
             'subtitle': {
                 'enable': self.sub_enable_chk.isChecked(), 'font': self.sub_font.currentText(),
@@ -736,8 +734,6 @@ class VideoMixerApp(QMainWindow):
             if 'threads' in rules: self.thread_spin.setValue(rules['threads'])
             if 'anti_dedup' in rules: self.anti_dedup_chk.setChecked(rules['anti_dedup'])
             if 'auto_perf' in rules: self.auto_perf_chk.setChecked(rules['auto_perf'])
-            if 'output_date_folder' in rules and hasattr(self, 'output_date_folder_chk'): self.output_date_folder_chk.setChecked(rules['output_date_folder'])
-            if 'mix_preset' in rules and hasattr(self, 'mix_preset_combo'): self.mix_preset_combo.setCurrentText(rules['mix_preset'])
 
             sub = config.get('subtitle', {})
             if 'enable' in sub: self.sub_enable_chk.setChecked(sub['enable'])
@@ -1352,46 +1348,15 @@ class VideoMixerApp(QMainWindow):
         form_layout.setSpacing(12)
         form_layout.setFieldGrowthPolicy(QFormLayout.AllNonFixedFieldsGrow)
 
-        workflow_group = QGroupBox("0. 工作流预设与开工检查")
-        workflow_layout = QFormLayout()
-        preset_layout = QHBoxLayout()
-        self.mix_preset_combo = QComboBox()
-        self.mix_preset_combo.addItems([
-            "抖音竖屏带字幕",
-            "快手轻量差异化",
-            "低配电脑稳定",
-            "高性能批量生产",
-            "直播切片样片",
-        ])
-        preset_btn = QPushButton("应用预设")
-        preset_btn.clicked.connect(self.apply_mix_workflow_preset)
-        preset_layout.addWidget(self.mix_preset_combo, stretch=1)
-        preset_layout.addWidget(preset_btn)
-        workflow_layout.addRow("生产模板:", preset_layout)
-
-        check_layout = QHBoxLayout()
-        self.preflight_btn = QPushButton("开始前检查")
-        self.preflight_btn.clicked.connect(lambda: self.run_mixer_preflight(show_dialog=True))
-        self.preview_sample_btn = QPushButton("先生成一条预览样片")
-        self.preview_sample_btn.clicked.connect(self.start_preview_synthesis)
-        check_layout.addWidget(self.preflight_btn)
-        check_layout.addWidget(self.preview_sample_btn)
-        workflow_layout.addRow("生产确认:", check_layout)
-
-        self.output_date_folder_chk = QCheckBox("按日期自动归档输出")
-        self.output_date_folder_chk.setChecked(True)
-        self.mixer_summary_label = QLabel("任务概览：等待选择素材")
+        self.mixer_summary_label = QLabel("第一轨道会作为底层主画面，视频素材按随机裁剪时长覆盖，覆盖之间自动留 2-3 秒空档。")
         self.mixer_summary_label.setObjectName("appSubtitle")
         self.mixer_summary_label.setWordWrap(True)
-        workflow_layout.addRow("输出管理:", self.output_date_folder_chk)
-        workflow_layout.addRow(self.mixer_summary_label)
-        workflow_group.setLayout(workflow_layout)
-        form_layout.addRow(workflow_group)
+        form_layout.addRow(self.mixer_summary_label)
 
-        rule_group = QGroupBox("1. 裁剪混合"); r_layout = QFormLayout()
+        rule_group = QGroupBox("1. 覆盖裁剪"); r_layout = QFormLayout()
         clip_layout = QHBoxLayout(); self.min_clip_spin = QDoubleSpinBox(); self.min_clip_spin.setRange(0.5, 10.0); self.min_clip_spin.setValue(2.0); self.max_clip_spin = QDoubleSpinBox(); self.max_clip_spin.setRange(0.5, 20.0); self.max_clip_spin.setValue(3.0)
         clip_layout.addWidget(QLabel("从")); clip_layout.addWidget(self.min_clip_spin); clip_layout.addWidget(QLabel("到")); clip_layout.addWidget(self.max_clip_spin); clip_layout.addWidget(QLabel("秒"))
-        r_layout.addRow("随机裁剪:", clip_layout)
+        r_layout.addRow("覆盖素材时长:", clip_layout)
         audio_layout = QHBoxLayout(); self.main_vol_spin = QDoubleSpinBox(); self.main_vol_spin.setValue(2.0); self.bgm_vol_spin = QDoubleSpinBox(); self.bgm_vol_spin.setValue(0.2)
         audio_layout.addWidget(QLabel("主音:")); audio_layout.addWidget(self.main_vol_spin); audio_layout.addWidget(QLabel("BGM:")); audio_layout.addWidget(self.bgm_vol_spin)
         r_layout.addRow("混音倍率:", audio_layout); rule_group.setLayout(r_layout); form_layout.addRow(rule_group)
@@ -3081,8 +3046,7 @@ class VideoMixerApp(QMainWindow):
 
     def _mixer_output_dir(self):
         base_dir = os.path.abspath(self.tab_folders['保存视频'])
-        if hasattr(self, 'output_date_folder_chk') and self.output_date_folder_chk.isChecked():
-            base_dir = os.path.join(base_dir, time.strftime("%Y-%m-%d"))
+        base_dir = os.path.join(base_dir, time.strftime("%Y-%m-%d"))
         os.makedirs(base_dir, exist_ok=True)
         return base_dir
 
@@ -3161,8 +3125,7 @@ class VideoMixerApp(QMainWindow):
         selected_vids = self.get_selected_mixer_assets('视频素材')
         selected_covers = self.get_selected_mixer_assets('封面图片')
         selected_bgms = self.get_selected_mixer_assets('背景音乐')
-        selected_seq1 = self.get_selected_mixer_assets('开头素材(段1)')
-        selected_seq2 = self.get_selected_mixer_assets('承接素材(段2)')
+        selected_first_track = self.get_selected_mixer_assets('第一轨道')
 
         errors = []
         warnings = []
@@ -3186,8 +3149,8 @@ class VideoMixerApp(QMainWindow):
             ok.append(f"封面图片 {len(selected_covers)} 张")
         if selected_bgms:
             ok.append(f"背景音乐 {len(selected_bgms)} 条")
-        if selected_seq1 or selected_seq2:
-            ok.append(f"固定开头/承接素材：{len(selected_seq1)} / {len(selected_seq2)}")
+        if selected_first_track:
+            ok.append(f"第一轨道：{len(selected_first_track)} 条")
 
         if self.min_clip_spin.value() > self.max_clip_spin.value():
             errors.append("最小裁剪秒数不能大于最大裁剪秒数")
@@ -3275,11 +3238,10 @@ class VideoMixerApp(QMainWindow):
 
     def start_synthesis(self, preview_only=False):
         selected_audios = self.get_selected_mixer_assets('音频素材')
+        selected_first_track = self.get_selected_mixer_assets('第一轨道')
         selected_vids = self.get_selected_mixer_assets('视频素材')
-        if not selected_audios or not selected_vids: QMessageBox.warning(self, "拦截", "❌ 音频素材 或 视频素材 未勾选！"); return
-        ok, report = self.run_mixer_preflight(show_dialog=False)
-        if not ok:
-            QMessageBox.warning(self, "开始前检查未通过", report)
+        if not selected_audios or not selected_first_track or not selected_vids:
+            QMessageBox.warning(self, "素材缺失", "请至少勾选：音频素材、第一轨道、视频素材。")
             return
         if self.auto_perf_chk.isChecked():
             self.apply_best_performance_profile(silent=True)
@@ -3291,7 +3253,7 @@ class VideoMixerApp(QMainWindow):
         task_data = {
             'audios': selected_audios, 
             'videos': selected_vids, 'covers': self.get_selected_mixer_assets('封面图片'), 'bgms': self.get_selected_mixer_assets('背景音乐'),
-            'seq1_videos': self.get_selected_mixer_assets('开头素材(段1)'), 'seq2_videos': self.get_selected_mixer_assets('承接素材(段2)'), 
+            'first_track_videos': selected_first_track,
             'watermarks': self.watermarks_data, 'duration_cache': self.duration_cache,
             'min_clip': self.min_clip_spin.value(), 'max_clip': self.max_clip_spin.value(),
             'trans_type': self.trans_combo.currentText(), 'trans_dur': self.trans_duration.value(),

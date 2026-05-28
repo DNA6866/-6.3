@@ -376,8 +376,7 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
             final_enc_args = ['-c:v', 'libx264', '-preset', 'fast', '-b:v', '5M', '-profile:v', 'high', '-level', '4.1']
             
         anti_dedup = self.task_data.get('anti_dedup', True)
-        seq1_videos = self.task_data.get('seq1_videos', [])
-        seq2_videos = self.task_data.get('seq2_videos', [])
+        first_track_videos = self.task_data.get('first_track_videos', [])
         sys_fonts_list = list(self.task_data.get('sys_fonts', {}).values())
 
         target_w, target_h = target_res.split(':')
@@ -401,62 +400,108 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
                 'offset_x': random.randint(-15, 15), 'offset_y': random.randint(-15, 15)
             })
         
-        current_time = 0.0; clip_plan = []
-        while current_time < audio_dur:
-            if not self.is_running: return
-            clip_idx = len(clip_plan)
-            if clip_idx == 0 and seq1_videos: valid_vid = random.choice(seq1_videos)['path']
-            elif clip_idx == 1 and seq2_videos: valid_vid = random.choice(seq2_videos)['path']
-            else: valid_vid = random.choice(video_pool)
-                
-            raw_dur = self.get_duration(valid_vid); valid_dur = raw_dur - 0.8 
-            if valid_dur < 1.0: continue
-            actual_max = min(max_clip, valid_dur); actual_min = min(min_clip, actual_max - 0.1) 
-            clip_dur = random.uniform(actual_min, actual_max); overlap = trans_dur if (use_trans and len(clip_plan) > 0) else 0.0
-            progress = clip_dur - overlap; gap = audio_dur - current_time
-            fade_out = False
-            if progress >= gap: clip_dur = gap + overlap; fade_out = True
-            clip_plan.append({'video': valid_vid, 'start': random.uniform(0, valid_dur - clip_dur), 'duration': clip_dur, 'fade_out': fade_out, 'global_start': current_time })
-            current_time += (clip_dur - overlap)
-
-        concat_list = []
-        for j, plan in enumerate(clip_plan):
-            if not self.is_running: return 
-            temp_clip = os.path.join(cache_dir, f"temp_{unique_id}_clip_{j}.ts"); concat_list.append(temp_clip)
-            base_vf = f"scale={target_w}:{target_h}:force_original_aspect_ratio=decrease,pad={target_w}:{target_h}:(ow-iw)/2:(oh-ih)/2:color=black,setparams=color_primaries=bt709:color_trc=bt709:colorspace=bt709"
-            vid_speed = 1.0; vid_start = plan['start']; vid_dur = plan['duration']
-            
-            if anti_dedup:
-                vid_speed = round(random.uniform(0.95, 1.05), 3)
-                base_vf += f",setpts={1.0/vid_speed}*PTS"
-                zoom = round(random.uniform(1.01, 1.04), 3)
-                base_vf += f",scale=iw*{zoom}:ih*{zoom},crop={target_w}:{target_h}"
-                eq_b = round(random.uniform(-0.03, 0.03), 3); eq_c = round(random.uniform(0.97, 1.03), 3); eq_s = round(random.uniform(0.97, 1.03), 3)
-                base_vf += f",eq=brightness={eq_b}:contrast={eq_c}:saturation={eq_s}"
-
-            if plan['fade_out'] and not use_trans and plan['duration'] > 1.5: 
-                base_vf += f",fade=t=out:st={plan['duration']-0.5:.3f}:d=0.5"
-            
-            base_vf += f",format={pix_fmt},fps=30,settb=1/90000"
-            is_first = (j == 0)
-            wm_filter_str = self.generate_watermark_filter(resolved_watermarks, cache_dir, unique_id, time_offset=plan['global_start'], is_first_clip=is_first)
-            vf_filter = base_vf + wm_filter_str
-            
-            cmd = [
-                self.ffmpeg_exe, '-y', '-hide_banner', '-loglevel', 'error', 
-                '-ss', f"{vid_start:.3f}", '-i', plan['video'], '-t', f"{vid_dur * vid_speed:.3f}", 
-                '-vf', vf_filter, *enc_args, '-an', '-r', '30', '-pix_fmt', pix_fmt, temp_clip
-            ]
-            if not self.run_ffmpeg(cmd, cwd=cache_dir): return
-
-        if not self.is_running: return 
-        
         main_v_no_audio = os.path.join(cache_dir, f"main_v_{unique_id}.ts")
+        concat_list = []
+        if first_track_videos:
+            base_track = random.choice(first_track_videos)['path']
+            overlay_plan = []
+            cursor = random.uniform(2.0, 3.0)
+            while cursor < audio_dur:
+                if not self.is_running: return
+                valid_vid = random.choice(video_pool)
+                raw_dur = self.get_duration(valid_vid)
+                valid_dur = raw_dur - 0.8
+                if valid_dur < 1.0:
+                    continue
+                remaining = audio_dur - cursor
+                actual_max = min(max_clip, valid_dur, remaining)
+                if actual_max < 0.5:
+                    break
+                actual_min = min(min_clip, actual_max)
+                clip_dur = random.uniform(actual_min, actual_max)
+                overlay_plan.append({
+                    'video': valid_vid,
+                    'start': random.uniform(0, max(0.0, valid_dur - clip_dur)),
+                    'duration': clip_dur,
+                    'global_start': cursor
+                })
+                cursor += clip_dur + random.uniform(2.0, 3.0)
+
+            self.log_signal.emit(f"[{unique_id}] 第一轨道覆盖模式：底轨 {os.path.basename(base_track)}，覆盖片段 {len(overlay_plan)} 段。")
+            scale_vf = f"scale={target_w}:{target_h}:force_original_aspect_ratio=decrease,pad={target_w}:{target_h}:(ow-iw)/2:(oh-ih)/2:color=black,setparams=color_primaries=bt709:color_trc=bt709:colorspace=bt709"
+            overlay_cmd_inputs = [self.ffmpeg_exe, '-y', '-hide_banner', '-loglevel', 'error', '-stream_loop', '-1', '-i', base_track]
+            filter_parts = [f"[0:v]{scale_vf},trim=duration={audio_dur:.3f},setpts=PTS-STARTPTS[base0]"]
+            last_label = "base0"
+            for idx, plan in enumerate(overlay_plan, 1):
+                overlay_cmd_inputs.extend(['-ss', f"{plan['start']:.3f}", '-t', f"{plan['duration']:.3f}", '-i', plan['video']])
+                start_t = plan['global_start']
+                end_t = start_t + plan['duration']
+                ov_label = f"ov{idx}"
+                out_label = f"base{idx}"
+                filter_parts.append(f"[{idx}:v]{scale_vf},trim=duration={plan['duration']:.3f},setpts=PTS-STARTPTS+{start_t:.3f}/TB[{ov_label}]")
+                filter_parts.append(f"[{last_label}][{ov_label}]overlay=0:0:eof_action=pass:enable='between(t\\,{start_t:.3f}\\,{end_t:.3f})'[{out_label}]")
+                last_label = out_label
+
+            final_vf = f"[{last_label}]format={pix_fmt},fps=30,settb=1/90000"
+            final_vf += self.generate_watermark_filter(resolved_watermarks, cache_dir, unique_id, time_offset=0.0, is_first_clip=True)
+            filter_parts.append(final_vf + "[vout]")
+            overlay_cmd = overlay_cmd_inputs + [
+                '-filter_complex', ';'.join(filter_parts),
+                '-map', '[vout]', *enc_args, '-an', '-r', '30', '-pix_fmt', pix_fmt, main_v_no_audio
+            ]
+            if not self.run_ffmpeg(overlay_cmd, cwd=cache_dir): return
+        else:
+            current_time = 0.0; clip_plan = []
+            while current_time < audio_dur:
+                if not self.is_running: return
+                valid_vid = random.choice(video_pool)
+
+                raw_dur = self.get_duration(valid_vid); valid_dur = raw_dur - 0.8
+                if valid_dur < 1.0: continue
+                actual_max = min(max_clip, valid_dur); actual_min = min(min_clip, actual_max - 0.1)
+                clip_dur = random.uniform(actual_min, actual_max); overlap = trans_dur if (use_trans and len(clip_plan) > 0) else 0.0
+                progress = clip_dur - overlap; gap = audio_dur - current_time
+                fade_out = False
+                if progress >= gap: clip_dur = gap + overlap; fade_out = True
+                clip_plan.append({'video': valid_vid, 'start': random.uniform(0, valid_dur - clip_dur), 'duration': clip_dur, 'fade_out': fade_out, 'global_start': current_time })
+                current_time += (clip_dur - overlap)
+
+            for j, plan in enumerate(clip_plan):
+                if not self.is_running: return
+                temp_clip = os.path.join(cache_dir, f"temp_{unique_id}_clip_{j}.ts"); concat_list.append(temp_clip)
+                base_vf = f"scale={target_w}:{target_h}:force_original_aspect_ratio=decrease,pad={target_w}:{target_h}:(ow-iw)/2:(oh-ih)/2:color=black,setparams=color_primaries=bt709:color_trc=bt709:colorspace=bt709"
+                vid_speed = 1.0; vid_start = plan['start']; vid_dur = plan['duration']
+
+                if anti_dedup:
+                    vid_speed = round(random.uniform(0.95, 1.05), 3)
+                    base_vf += f",setpts={1.0/vid_speed}*PTS"
+                    zoom = round(random.uniform(1.01, 1.04), 3)
+                    base_vf += f",scale=iw*{zoom}:ih*{zoom},crop={target_w}:{target_h}"
+                    eq_b = round(random.uniform(-0.03, 0.03), 3); eq_c = round(random.uniform(0.97, 1.03), 3); eq_s = round(random.uniform(0.97, 1.03), 3)
+                    base_vf += f",eq=brightness={eq_b}:contrast={eq_c}:saturation={eq_s}"
+
+                if plan['fade_out'] and not use_trans and plan['duration'] > 1.5:
+                    base_vf += f",fade=t=out:st={plan['duration']-0.5:.3f}:d=0.5"
+
+                base_vf += f",format={pix_fmt},fps=30,settb=1/90000"
+                is_first = (j == 0)
+                wm_filter_str = self.generate_watermark_filter(resolved_watermarks, cache_dir, unique_id, time_offset=plan['global_start'], is_first_clip=is_first)
+                vf_filter = base_vf + wm_filter_str
+
+                cmd = [
+                    self.ffmpeg_exe, '-y', '-hide_banner', '-loglevel', 'error',
+                    '-ss', f"{vid_start:.3f}", '-i', plan['video'], '-t', f"{vid_dur * vid_speed:.3f}",
+                    '-vf', vf_filter, *enc_args, '-an', '-r', '30', '-pix_fmt', pix_fmt, temp_clip
+                ]
+                if not self.run_ffmpeg(cmd, cwd=cache_dir): return
+
         real_trans_map = {k: v for k, v in TRANS_MAP.items() if "不使用" not in k and "随机" not in k}
         real_trans_keys = list(real_trans_map.keys())
 
         fallback_to_concat = False 
-        if use_trans and len(concat_list) > 1:
+        if first_track_videos:
+            fallback_to_concat = False
+        elif use_trans and len(concat_list) > 1:
             filter_complex_final = ""; inputs = []; current_offset = 0.0; last_out = "0:v"
             for clip in concat_list: inputs.extend(['-i', clip])
             for k in range(1, len(concat_list)):
