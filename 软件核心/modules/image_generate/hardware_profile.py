@@ -10,30 +10,92 @@ def _parse_version(value):
     nums = re.findall(r"\d+", str(value or ""))
     return tuple(int(x) for x in nums[:3]) if nums else (0,)
 
+def _candidate_nvidia_smi_paths():
+    candidates = ["nvidia-smi"]
+    for base in (
+        os.environ.get("ProgramFiles"),
+        os.environ.get("ProgramW6432"),
+        r"C:\Program Files",
+    ):
+        if base:
+            candidates.append(os.path.join(base, "NVIDIA Corporation", "NVSMI", "nvidia-smi.exe"))
+    system_root = os.environ.get("SystemRoot", r"C:\Windows")
+    candidates.append(os.path.join(system_root, "System32", "nvidia-smi.exe"))
 
-def _query_nvidia():
+    result = []
+    seen = set()
+    for path in candidates:
+        key = os.path.normcase(path)
+        if key in seen:
+            continue
+        seen.add(key)
+        if path == "nvidia-smi" or os.path.exists(path):
+            result.append(path)
+    return result
+
+def _run_probe(cmd, timeout=8):
     try:
-        res = subprocess.run(
-            ["nvidia-smi", "--query-gpu=name,driver_version,memory.total", "--format=csv,noheader,nounits"],
+        return subprocess.run(
+            cmd,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
             encoding="utf-8",
             errors="ignore",
-            timeout=8,
+            timeout=timeout,
             startupinfo=hidden_startupinfo(),
         )
-        if res.returncode == 0 and res.stdout.strip():
+    except Exception as exc:
+        return exc
+
+def _query_nvidia_smi():
+    for exe in _candidate_nvidia_smi_paths():
+        res = _run_probe(
+            [exe, "--query-gpu=name,driver_version,memory.total", "--format=csv,noheader,nounits"],
+            timeout=8,
+        )
+        if isinstance(res, subprocess.CompletedProcess) and res.returncode == 0 and res.stdout.strip():
             parts = [p.strip() for p in res.stdout.strip().splitlines()[0].split(",")]
             return {
                 "ok": True,
                 "name": parts[0] if parts else "",
                 "driver": parts[1] if len(parts) > 1 else "",
                 "vram_mb": int(float(parts[2])) if len(parts) > 2 and parts[2] else 0,
+                "source": exe,
             }
-    except Exception as exc:
-        return {"ok": False, "error": str(exc)}
-    return {"ok": False, "error": "未检测到 NVIDIA 显卡"}
+    return None
+
+def _query_windows_nvidia_name():
+    commands = [
+        ["wmic", "path", "win32_VideoController", "get", "name"],
+        [
+            "powershell",
+            "-NoProfile",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-Command",
+            "$OutputEncoding=[Console]::OutputEncoding=[Text.Encoding]::UTF8; "
+            "(Get-CimInstance Win32_VideoController | ForEach-Object {$_.Name}) -join \"`n\"",
+        ],
+    ]
+    for cmd in commands:
+        res = _run_probe(cmd, timeout=6)
+        if not isinstance(res, subprocess.CompletedProcess) or not res.stdout:
+            continue
+        lines = [line.strip() for line in res.stdout.splitlines() if line.strip() and line.strip().lower() != "name"]
+        name = next((line for line in lines if any(k in line.lower() for k in ("nvidia", "geforce", "rtx"))), "")
+        if name:
+            return name
+    return ""
+
+def _query_nvidia():
+    smi = _query_nvidia_smi()
+    if smi:
+        return smi
+    name = _query_windows_nvidia_name()
+    if name:
+        return {"ok": True, "name": name, "driver": "", "vram_mb": 0, "source": "Windows 显卡信息"}
+    return {"ok": False, "error": "未检测到 NVIDIA 显卡，或 nvidia-smi / Windows 显卡信息均不可用"}
 
 
 def _detect_series(gpu_name):
@@ -57,6 +119,9 @@ def _query_engine_torch(comfyui_path):
         "'cuda_version': torch.version.cuda, 'cuda_available': bool(torch.cuda.is_available())})\n"
         " if torch.cuda.is_available():\n"
         "  data['capability']='.'.join(map(str, torch.cuda.get_device_capability(0)))\n"
+        "  props=torch.cuda.get_device_properties(0)\n"
+        "  data['device_name']=props.name\n"
+        "  data['vram_mb']=int(props.total_memory/1024/1024)\n"
         "except Exception as e:\n"
         " data['error']=str(e)\n"
         "print(json.dumps(data, ensure_ascii=False))\n"
@@ -86,6 +151,11 @@ def _query_engine_torch(comfyui_path):
 def detect_hardware_profile(comfyui_path):
     gpu = _query_nvidia()
     torch_info = _query_engine_torch(comfyui_path)
+    if torch_info.get("cuda_available"):
+        gpu["ok"] = True
+        gpu["name"] = gpu.get("name") or torch_info.get("device_name", "")
+        gpu["vram_mb"] = max(int(gpu.get("vram_mb") or 0), int(torch_info.get("vram_mb") or 0))
+        gpu["source"] = gpu.get("source") or "PyTorch CUDA"
     series = _detect_series(gpu.get("name", ""))
     vram_mb = gpu.get("vram_mb", 0)
     driver_version = _parse_version(gpu.get("driver", ""))
@@ -95,14 +165,14 @@ def detect_hardware_profile(comfyui_path):
     failures = []
 
     if not gpu.get("ok"):
-        failures.append("未检测到 NVIDIA 显卡或 nvidia-smi 不可用。")
+        failures.append("未检测到 NVIDIA 显卡，或当前 AI 引擎无法从 PyTorch/系统信息读取显卡。")
     if not torch_info.get("torch_available"):
         failures.append("自带 AI 引擎无法导入 PyTorch。")
     if torch_info.get("torch_available") and not torch_info.get("cuda_available"):
         failures.append("自带 AI 引擎的 PyTorch 无法调用 GPU。")
 
     if series == "50系":
-        if driver_version < (570,):
+        if gpu.get("driver") and driver_version < (570,):
             failures.append("RTX 50 系需要较新的 NVIDIA 驱动，建议安装 R570 或更高版本。")
         if torch_version < (2, 7) or cuda_version < (12, 8):
             failures.append("RTX 50 系需要 PyTorch 2.7+ 与 CUDA 12.8+ 的 AI 引擎。")

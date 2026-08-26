@@ -46,16 +46,19 @@ class ComfyUIApi:
     def history(self, prompt_id):
         return self._request_json(f"/history/{prompt_id}", timeout=10)
 
-    def wait_for_images(self, prompt_id, output_dir, timeout=900, poll_interval=1.2):
+    def wait_for_images(self, prompt_id, output_dir, timeout=900, poll_interval=1.2, canceller=None):
+        """等待图片生成完成。canceller 为可调用对象，返回 True 时取消等待。"""
         os.makedirs(output_dir, exist_ok=True)
         start = time.time()
         while time.time() - start < timeout:
+            if canceller and canceller():
+                return None  # 被取消
             hist = self.history(prompt_id)
             item = hist.get(prompt_id)
             if item:
                 status = item.get("status", {})
                 if status.get("completed") is False and status.get("status_str") == "error":
-                    raise ComfyAPIError("图片生成失败，请先点击“检测环境”，确认通过后再重试。")
+                    raise ComfyAPIError('图片生成失败，请先点击"检测环境"，确认通过后再重试。')
                 outputs = item.get("outputs", {})
                 files = []
                 for node_output in outputs.values():
@@ -65,6 +68,24 @@ class ComfyUIApi:
                     return files
             time.sleep(poll_interval)
         raise ComfyAPIError("图片生成等待超时，请检查 ComfyUI 是否仍在运行。")
+
+    def interrupt(self):
+        """中断当前正在执行的生成任务。POST /interrupt"""
+        try:
+            self._request_json("/interrupt", payload={}, timeout=5)
+            return True
+        except Exception:
+            return False
+
+    def clear_queue(self):
+        """清空队列中所有等待中的任务。POST /queue with DELETE"""
+        try:
+            url = self.base_url + "/queue"
+            req = urllib.request.Request(url, data=b'{"delete":["*"]}', headers={"Content-Type": "application/json"}, method="POST")
+            urllib.request.urlopen(req, timeout=5)
+            return True
+        except Exception:
+            return False
 
     def download_image(self, image_info, output_dir):
         params = urllib.parse.urlencode({

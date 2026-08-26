@@ -79,7 +79,7 @@ QLabel#hardwareStatus {
 
 QLabel#brandTitle {
     color: #F8FAFC;
-    font-size: 18px;
+    font-size: 16px;
     font-weight: 800;
 }
 
@@ -88,12 +88,21 @@ QLabel#brandSubTitle {
     font-size: 11px;
 }
 
-QGroupBox, QFrame#card {
+QGroupBox {
     background: #111827;
     border: 1px solid #334155;
     border-radius: 10px;
     margin-top: 18px;
     padding: 14px 12px 12px 12px;
+    font-weight: 700;
+}
+
+QFrame#card {
+    background: #111827;
+    border: 1px solid #334155;
+    border-radius: 10px;
+    margin-top: 0;
+    padding: 0;
     font-weight: 700;
 }
 
@@ -187,9 +196,10 @@ QPushButton[navButton="true"] {
     background: #111827;
     border: 1px solid #475569;
     color: #E2E8F0;
-    min-height: 40px;
-    padding: 8px 12px;
+    min-height: 36px;
+    padding: 7px 10px;
     text-align: left;
+    font-size: 12px;
 }
 
 QPushButton[navButton="true"]:hover {
@@ -349,6 +359,45 @@ QLineEdit, QPlainTextEdit, QTextEdit, QComboBox, QSpinBox, QDoubleSpinBox {
     selection-background-color: #2563EB;
 }
 
+QLineEdit#segmentPathEditor {
+    border-radius: 0px;
+    padding: 4px 6px;
+}
+
+QSpinBox::up-button, QSpinBox::down-button,
+QDoubleSpinBox::up-button, QDoubleSpinBox::down-button {
+    background: #0F172A;
+    border-left: 1px solid #334155;
+    width: 16px;
+    margin: 1px;
+}
+
+QSpinBox::up-button, QDoubleSpinBox::up-button {
+    border-top-right-radius: 7px;
+}
+
+QSpinBox::down-button, QDoubleSpinBox::down-button {
+    border-bottom-right-radius: 7px;
+}
+
+QSpinBox::up-arrow, QDoubleSpinBox::up-arrow {
+    image: none;
+    width: 0;
+    height: 0;
+    border-left: 4px solid transparent;
+    border-right: 4px solid transparent;
+    border-bottom: 5px solid #CBD5E1;
+}
+
+QSpinBox::down-arrow, QDoubleSpinBox::down-arrow {
+    image: none;
+    width: 0;
+    height: 0;
+    border-left: 4px solid transparent;
+    border-right: 4px solid transparent;
+    border-top: 5px solid #CBD5E1;
+}
+
 QListWidget {
     background: #020617;
     border: 1px solid #475569;
@@ -369,8 +418,8 @@ QTabBar::tab {
     color: #CBD5E1;
     border: 1px solid #334155;
     border-bottom: none;
-    padding: 8px 14px;
-    min-width: 88px;
+    padding: 8px 12px;
+    min-width: 94px;
 }
 
 QTabBar::tab:selected {
@@ -386,7 +435,15 @@ QTabBar::tab:hover {
 
 QComboBox::drop-down {
     border: none;
-    width: 24px;
+    width: 0;
+}
+
+QComboBox::down-arrow {
+    image: none;
+    width: 0;
+    height: 0;
+    border: none;
+    margin: 0;
 }
 
 QComboBox QAbstractItemView {
@@ -397,11 +454,13 @@ QComboBox QAbstractItemView {
     selection-color: #FFFFFF;
     outline: none;
     padding: 4px;
+    min-width: 160px;
 }
 
 QComboBox QAbstractItemView::item {
     min-height: 28px;
-    padding: 6px 8px;
+    padding: 6px 10px;
+    white-space: nowrap;
 }
 
 QComboBox QAbstractItemView::item:hover {

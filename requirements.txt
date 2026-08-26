@@ -7,7 +7,6 @@ PyQt5==5.15.11
 PyQt5-Qt5==5.15.2
 PyQt5_sip==12.18.0
 pywin32-ctypes==0.2.3
-zhconv==1.4.3
 numpy
 soundfile
 librosa
@@ -17,9 +16,8 @@ ffmpeg-python
 voxcpm
 torch
 torchaudio
-yt-dlp
+yt-dlp==2026.6.9
 requests
-yt-dlp
 funasr
 tiktoken
 modelscope

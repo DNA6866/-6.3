@@ -40,3 +40,10 @@ third_party/
 .DS_Store
 Thumbs.db
 
+# Local dev scratch / temp
+.codebuddy/
+err.txt
+_*.py
+_tmp/
+.tmp/
+

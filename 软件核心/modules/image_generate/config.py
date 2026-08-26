@@ -17,6 +17,8 @@ WORKFLOW_DIR = runtime_path("workflows", "zimage")
 LOG_DIR = logs_dir()
 CONFIG_FILE = os.path.join(CONFIG_DIR, "image_generate_config.json")
 ENV_REPORT_FILE = os.path.join(LOG_DIR, "image_generate_env_report.txt")
+STARTUP_LOG_FILE = os.path.join(LOG_DIR, "comfyui_startup.log")
+DIAGNOSTIC_FILE = os.path.join(LOG_DIR, "image_generate_diagnostic.txt")
 BUNDLED_COMFYUI_PATH = runtime_path("engines", "ComfyUI", "ComfyUI")
 DEV_COMFYUI_PATH = "D:/ComfyUI/ComfyUI"
 
@@ -33,6 +35,7 @@ DEFAULT_CONFIG = {
     "output_dir": OUTPUT_DIR,
     "host": "127.0.0.1",
     "port": 8199,
+    "startup_timeout": 180,
     "auto_start_comfyui": True,
     "auto_hardware_profile": True,
     "comfyui_args": [],

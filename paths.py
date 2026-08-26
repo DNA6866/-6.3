@@ -31,13 +31,56 @@ def ensure_core_path():
 ensure_core_path()
 
 
+def _unique_paths(paths):
+    result = []
+    seen = set()
+    for path in paths:
+        if not path:
+            continue
+        normalized = os.path.normcase(os.path.abspath(path))
+        if normalized in seen:
+            continue
+        seen.add(normalized)
+        result.append(os.path.abspath(path))
+    return result
+
+
+def resource_root_candidates():
+    """列出可能的网盘资源包位置，兼容客户误套一层目录的旧安装结构。"""
+    parent = os.path.dirname(APP_ROOT)
+    candidates = [
+        os.environ.get("NYY_RESOURCE_ROOT", ""),
+        RESOURCE_ROOT,
+        os.path.join(parent, RESOURCE_BUNDLE_DIRNAME),
+    ]
+    for base in _unique_paths((APP_ROOT,)):
+        try:
+            with os.scandir(base) as entries:
+                nested = [
+                    os.path.join(entry.path, RESOURCE_BUNDLE_DIRNAME)
+                    for entry in entries
+                    if entry.is_dir(follow_symlinks=False)
+                    and os.path.isdir(os.path.join(entry.path, RESOURCE_BUNDLE_DIRNAME))
+                ]
+            candidates.extend(sorted(nested, key=os.path.normcase))
+        except OSError:
+            continue
+    return _unique_paths(candidates)
+
+
+def _runtime_candidates(*parts):
+    candidates = [os.path.join(RESOURCE_ROOT, *parts), os.path.join(APP_ROOT, *parts)]
+    candidates.extend(os.path.join(root, *parts) for root in resource_root_candidates())
+    return _unique_paths(candidates)
+
+
 def runtime_path(*parts):
     """运行资源路径：优先使用网盘资源包，兼容旧版根目录资源。"""
-    bundled = os.path.join(RESOURCE_ROOT, *parts)
-    legacy = os.path.join(APP_ROOT, *parts)
-    if os.path.exists(bundled) or not os.path.exists(legacy):
-        return bundled
-    return legacy
+    candidates = _runtime_candidates(*parts)
+    for candidate in candidates:
+        if os.path.exists(candidate):
+            return candidate
+    return candidates[0]
 
 
 def workspace_path(*parts):
@@ -55,25 +98,21 @@ def core_path(*parts):
     return legacy
 
 
-def config_dir():
-    return workspace_path("配置")
-
-
 def logs_dir():
     return workspace_path("日志")
 
 
+def config_dir():
+    return workspace_path("配置")
+
+
 def tools_dir():
+    candidates = _runtime_candidates("tools")
+    for candidate in candidates:
+        if all(os.path.isfile(os.path.join(candidate, name)) for name in ("ffmpeg.exe", "ffprobe.exe")):
+            return candidate
     return runtime_path("tools")
 
 
 def models_dir():
     return runtime_path("models")
-
-
-def engines_dir():
-    return runtime_path("engines")
-
-
-def workflows_dir():
-    return runtime_path("workflows")

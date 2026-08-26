@@ -1,6 +1,4 @@
 import os
-import re
-import shutil
 import subprocess
 import time
 
@@ -9,8 +7,8 @@ from PyQt5.QtCore import QThread, pyqtSignal
 from paths import models_dir, tools_dir
 from .config import APP_ROOT, OUTPUT_DIR
 from .env_check import check_environment
-from .voice_engine import VoxCPM2Engine, VoiceCloneError, humanize_error
 from .audio_tools import extract_audio_from_media, normalize_audio_loudness, make_output_path
+from .runtime_support import RUNTIME_LOG_FILE, cancel_voice_task, run_voice_task
 
 
 def _hidden_startupinfo():
@@ -45,56 +43,7 @@ def _find_ffmpeg():
     bundled = os.path.join(tools_dir(), "ffmpeg.exe")
     if os.path.exists(bundled):
         return bundled
-    return shutil.which("ffmpeg") or ""
-
-
-def _is_ascii_path(path):
-    try:
-        str(path).encode("ascii")
-        return True
-    except Exception:
-        return False
-
-
-def _subst_ascii_dir(path):
-    """部分 ASR 底层库在 Windows 下读中文模型路径会失败，临时映射成纯英文盘符。"""
-    if os.name != "nt" or not path or _is_ascii_path(path):
-        return path, ""
-    abs_path = os.path.abspath(path)
-    if not os.path.isdir(abs_path):
-        return path, ""
-    for letter in "ZYXWVUTSRQPONMLKJIHGFEDCBA":
-        drive = f"{letter}:"
-        if os.path.exists(drive + "\\"):
-            continue
-        result = subprocess.run(
-            ["subst", drive, abs_path],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            encoding="utf-8",
-            errors="ignore",
-            startupinfo=_hidden_startupinfo(),
-        )
-        if result.returncode == 0:
-            return drive + "\\", drive
-    return path, ""
-
-
-def _release_subst_drive(drive):
-    if os.name == "nt" and drive:
-        subprocess.run(
-            ["subst", drive, "/D"],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            startupinfo=_hidden_startupinfo(),
-        )
-
-
-def _clean_asr_text(text):
-    text = re.sub(r"<\|[^>]+?\|>", "", text or "")
-    text = re.sub(r"\s+", " ", text).strip()
-    return text
+    return ""
 
 
 def _run_cmd(cmd, cwd=None):
@@ -145,67 +94,29 @@ class VoiceGenerateWorker(QThread):
     def __init__(self, task):
         super().__init__()
         self.task = task
-        self.engine = None
+        self._process_holder = {}
+
+    def cancel(self):
+        cancel_voice_task(self._process_holder)
+
+    def _on_event(self, event):
+        if "progress" in event:
+            self.progress.emit(int(event["progress"]))
+        if event.get("message"):
+            self.message.emit(str(event["message"]))
 
     def run(self):
         try:
             self.progress.emit(5)
-            self.message.emit("正在加载 VoxCPM2 模型，首次加载可能较慢...")
-            self.engine = VoxCPM2Engine(
-                self.task["model_path"],
-                zipenhancer_model_path=self.task.get("zipenhancer_model_path", ""),
-                enable_denoiser=bool(self.task.get("enable_denoiser", False)),
-                optimize=bool(self.task.get("optimize", True)),
+            result = run_voice_task(
+                self.task,
+                event_callback=self._on_event,
+                process_holder=self._process_holder,
             )
-            self.engine.load_model()
-            self.progress.emit(35)
-
-            kind = self.task.get("kind")
-            self.message.emit("正在生成音频，请勿重复点击...")
-            if kind == "tts":
-                output = self.engine.generate_tts(
-                    text=self.task["text"],
-                    voice_description=self.task.get("voice_description", ""),
-                    output_path=self.task["output_path"],
-                    cfg_value=self.task.get("cfg_value", 2.0),
-                    inference_timesteps=self.task.get("inference_timesteps", 10),
-                    normalize=self.task.get("normalize", False),
-                )
-            elif kind == "clone":
-                output = self.engine.generate_clone(
-                    text=self.task["text"],
-                    reference_audio=self.task["reference_audio"],
-                    control_prompt=self.task.get("control_prompt", ""),
-                    output_path=self.task["output_path"],
-                    cfg_value=self.task.get("cfg_value", 2.0),
-                    inference_timesteps=self.task.get("inference_timesteps", 10),
-                    normalize=self.task.get("normalize", False),
-                    denoise=self.task.get("denoise", False),
-                )
-            elif kind == "ultimate":
-                output = self.engine.generate_ultimate_clone(
-                    text=self.task["text"],
-                    reference_audio=self.task["reference_audio"],
-                    prompt_text=self.task.get("prompt_text", ""),
-                    output_path=self.task["output_path"],
-                    cfg_value=self.task.get("cfg_value", 2.0),
-                    inference_timesteps=self.task.get("inference_timesteps", 10),
-                    normalize=self.task.get("normalize", False),
-                    denoise=self.task.get("denoise", False),
-                )
-            else:
-                raise VoiceCloneError("未知的音频生成任务。")
-
             self.progress.emit(100)
-            self.message.emit("音频生成完成。")
-            self.finished.emit(output)
-        except VoiceCloneError as exc:
-            self.failed.emit(str(exc))
+            self.finished.emit(result["output"])
         except Exception as exc:
-            self.failed.emit(humanize_error(exc))
-        finally:
-            if self.engine:
-                self.engine.unload_model()
+            self.failed.emit(str(exc))
 
 
 class BatchGenerateWorker(QThread):
@@ -217,9 +128,18 @@ class BatchGenerateWorker(QThread):
     def __init__(self, task):
         super().__init__()
         self.task = task
+        self._process_holder = {}
+
+    def cancel(self):
+        cancel_voice_task(self._process_holder)
+
+    def _on_event(self, event):
+        if "progress" in event:
+            self.progress.emit(int(event["progress"]))
+        if event.get("message"):
+            self.message.emit(str(event["message"]))
 
     def run(self):
-        engine = None
         try:
             input_file = self.task.get("input_file", "")
             output_dir = self.task.get("output_dir") or OUTPUT_DIR
@@ -230,66 +150,28 @@ class BatchGenerateWorker(QThread):
             if not texts:
                 raise RuntimeError("批量 txt 文件为空。")
             os.makedirs(output_dir, exist_ok=True)
-            self.message.emit(f"正在加载 VoxCPM2 模型，准备批量生成 {len(texts)} 条...")
             self.progress.emit(5)
-            engine = VoxCPM2Engine(
-                self.task["model_path"],
-                zipenhancer_model_path=self.task.get("zipenhancer_model_path", ""),
-                enable_denoiser=bool(self.task.get("enable_denoiser", False)),
-                optimize=bool(self.task.get("optimize", True)),
+            task = dict(self.task)
+            task.update({
+                "operation": "batch",
+                "texts": texts,
+                "output_dir": output_dir,
+                "output_paths": [
+                    make_output_path(output_dir, f"batch_{index:03d}", "wav")
+                    for index in range(1, len(texts) + 1)
+                ],
+            })
+            result = run_voice_task(
+                task,
+                event_callback=self._on_event,
+                process_holder=self._process_holder,
             )
-            engine.load_model()
-            success = 0
-            failed = 0
-            reference_audio = self.task.get("reference_audio", "")
-            prompt_text = self.task.get("prompt_text", "")
-            control_prompt = self.task.get("control_prompt", "")
-            for index, text in enumerate(texts, 1):
-                try:
-                    output_path = make_output_path(output_dir, f"batch_{index:03d}", "wav")
-                    self.message.emit(f"正在生成 {index}/{len(texts)}...")
-                    if reference_audio and prompt_text:
-                        engine.generate_ultimate_clone(
-                            text=text,
-                            reference_audio=reference_audio,
-                            prompt_text=prompt_text,
-                            output_path=output_path,
-                            cfg_value=self.task.get("cfg_value", 2.0),
-                            inference_timesteps=self.task.get("inference_timesteps", 10),
-                            normalize=self.task.get("normalize", False),
-                            denoise=self.task.get("denoise", False),
-                        )
-                    elif reference_audio:
-                        engine.generate_clone(
-                            text=text,
-                            reference_audio=reference_audio,
-                            control_prompt=control_prompt,
-                            output_path=output_path,
-                            cfg_value=self.task.get("cfg_value", 2.0),
-                            inference_timesteps=self.task.get("inference_timesteps", 10),
-                            normalize=self.task.get("normalize", False),
-                            denoise=self.task.get("denoise", False),
-                        )
-                    else:
-                        engine.generate_tts(
-                            text=text,
-                            voice_description=control_prompt,
-                            output_path=output_path,
-                            cfg_value=self.task.get("cfg_value", 2.0),
-                            inference_timesteps=self.task.get("inference_timesteps", 10),
-                            normalize=self.task.get("normalize", False),
-                        )
-                    success += 1
-                except Exception as item_error:
-                    failed += 1
-                    self.message.emit(f"第 {index} 条生成失败：{item_error}")
-                self.progress.emit(int(index / len(texts) * 100))
-            self.finished.emit(f"批量生成完成：成功 {success} 条，失败 {failed} 条，输出目录：{output_dir}")
+            self.finished.emit(
+                f"批量生成完成：成功 {result.get('success', 0)} 条，"
+                f"失败 {result.get('failed', 0)} 条，输出目录：{output_dir}"
+            )
         except Exception as exc:
             self.failed.emit(f"批量生成失败：{exc}")
-        finally:
-            if engine:
-                engine.unload_model()
 
 
 class AudioPrepareWorker(QThread):
@@ -345,6 +227,16 @@ class ReferenceTranscribeWorker(QThread):
         self.audio_path = audio_path
         self.output_dir = output_dir or OUTPUT_DIR
         self.asr_model_path = asr_model_path or os.path.join(models_dir(), "SenseVoiceSmall")
+        self._process_holder = {}
+
+    def cancel(self):
+        cancel_voice_task(self._process_holder)
+
+    def _on_event(self, event):
+        if "progress" in event:
+            self.progress.emit(int(event["progress"]))
+        if event.get("message"):
+            self.message.emit(str(event["message"]))
 
     def _transcribe_with_sensevoice(self):
         if not self.asr_model_path or not os.path.isdir(self.asr_model_path):
@@ -352,23 +244,17 @@ class ReferenceTranscribeWorker(QThread):
         model_file = os.path.join(self.asr_model_path, "model.pt")
         if not os.path.exists(model_file):
             raise RuntimeError("SenseVoiceSmall 模型文件不完整")
-        from funasr import AutoModel
-
-        self.message.emit("正在使用 SenseVoice 识别参考音频文字稿...")
-        self.progress.emit(35)
-        model_path, subst_drive = _subst_ascii_dir(self.asr_model_path)
-        try:
-            model = AutoModel(model=model_path, trust_remote_code=False, disable_update=True)
-            result = model.generate(input=self.audio_path, language="zh", use_itn=True, batch_size_s=60)
-        finally:
-            _release_subst_drive(subst_drive)
-        if isinstance(result, list) and result:
-            text = result[0].get("text", "")
-        elif isinstance(result, dict):
-            text = result.get("text", "")
-        else:
-            text = str(result)
-        text = _clean_asr_text(text)
+        result = run_voice_task(
+            {
+                "operation": "transcribe",
+                "kind": "transcribe",
+                "audio_path": self.audio_path,
+                "asr_model_path": self.asr_model_path,
+            },
+            event_callback=self._on_event,
+            process_holder=self._process_holder,
+        )
+        text = str(result.get("text") or "").strip()
         if not text:
             raise RuntimeError("SenseVoice 没有识别到有效文字")
         return text
@@ -396,7 +282,7 @@ class ReferenceTranscribeWorker(QThread):
             if not os.path.exists(txt_path):
                 raise RuntimeError("识别已结束，但没有生成文字稿文件。")
             with open(txt_path, "r", encoding="utf-8", errors="ignore") as f:
-                text = _clean_asr_text(f.read())
+                text = " ".join(f.read().split())
             if not text:
                 raise RuntimeError("没有识别到有效文字，请换一段人声更清晰的参考音频。")
             return text
@@ -423,5 +309,5 @@ class ReferenceTranscribeWorker(QThread):
         except Exception as exc:
             self.failed.emit(
                 "参考音频文字稿自动识别失败。请确认 SenseVoiceSmall 模型存在、参考音频有人声，"
-                f"并尽量使用 wav/mp3 格式。底层信息：{exc}"
+                f"并尽量使用 wav/mp3 格式。底层信息：{exc}。完整日志：{RUNTIME_LOG_FILE}"
             )

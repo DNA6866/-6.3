@@ -25,6 +25,8 @@ from PyQt5.QtWidgets import (
 )
 
 from paths import tools_dir
+from services.platform_service import open_path, open_url
+from ui_components import configure_spinbox_for_direct_input
 from .config import OUTPUT_DIR, load_config, save_config
 from .live_parser import select_stream_format
 from .task_worker import LiveDownloadWorker, LiveParseWorker
@@ -84,6 +86,7 @@ class AddLiveRoomDialog(QDialog):
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
         layout.addWidget(buttons)
+        configure_spinbox_for_direct_input(self)
 
     def get_data(self):
         return {
@@ -125,6 +128,7 @@ class LiveSettingsDialog(QDialog):
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
         layout.addWidget(buttons)
+        configure_spinbox_for_direct_input(self)
 
     def get_data(self):
         return {
@@ -146,6 +150,7 @@ class LiveDownloaderWidget(QWidget):
         self._normalize_rooms()
         self.save_state()
         self._build_ui()
+        configure_spinbox_for_direct_input(self)
         self.refresh_table()
         self.update_monitor_timer()
 
@@ -650,14 +655,14 @@ class LiveDownloaderWidget(QWidget):
         if not url:
             return
         try:
-            os.startfile(url)
+            open_url(url)
         except Exception as exc:
             QMessageBox.warning(self, "打开失败", f"无法打开直播间：{exc}")
 
     def open_output_dir(self):
         os.makedirs(self.config.get("output_dir", OUTPUT_DIR), exist_ok=True)
         try:
-            os.startfile(os.path.abspath(self.config.get("output_dir", OUTPUT_DIR)))
+            open_path(self.config.get("output_dir", OUTPUT_DIR))
         except Exception as exc:
             QMessageBox.warning(self, "打开失败", f"无法打开输出目录：{exc}")
 

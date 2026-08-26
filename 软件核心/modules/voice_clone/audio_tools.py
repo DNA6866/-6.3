@@ -2,6 +2,8 @@ import os
 import subprocess
 import time
 
+from services.platform_service import open_path
+
 
 def hidden_startupinfo():
     if os.name != 'nt':
@@ -28,7 +30,13 @@ def convert_to_wav(ffmpeg_path, input_path, output_path, sample_rate=16000, mono
         '-i', input_path, *channels, '-ar', str(sample_rate),
         '-c:a', 'pcm_s16le', output_path
     ]
-    subprocess.run(cmd, startupinfo=hidden_startupinfo(), check=True, capture_output=True)
+    subprocess.run(
+        cmd,
+        startupinfo=hidden_startupinfo(),
+        check=True,
+        capture_output=True,
+        timeout=300,
+    )
     return output_path
 
 
@@ -47,6 +55,7 @@ def get_media_duration(ffprobe_path, input_path):
             encoding="utf-8",
             errors="ignore",
             startupinfo=hidden_startupinfo(),
+            timeout=15,
         )
         return max(0.0, float((res.stdout or "0").strip()))
     except Exception:
@@ -59,7 +68,13 @@ def trim_audio(ffmpeg_path, input_path, output_path, start=0, duration=30):
         '-ss', str(start), '-i', input_path, '-t', str(duration),
         '-ac', '1', '-ar', '16000', '-c:a', 'pcm_s16le', output_path
     ]
-    subprocess.run(cmd, startupinfo=hidden_startupinfo(), check=True, capture_output=True)
+    subprocess.run(
+        cmd,
+        startupinfo=hidden_startupinfo(),
+        check=True,
+        capture_output=True,
+        timeout=300,
+    )
     return output_path
 
 
@@ -71,7 +86,13 @@ def extract_audio_from_media(ffmpeg_path, input_path, output_path, start=0, dura
     if float(duration or 0) > 0:
         cmd.extend(['-t', str(duration)])
     cmd.extend(['-vn', '-ac', '1', '-ar', str(sample_rate), '-c:a', 'pcm_s16le', output_path])
-    subprocess.run(cmd, startupinfo=hidden_startupinfo(), check=True, capture_output=True)
+    subprocess.run(
+        cmd,
+        startupinfo=hidden_startupinfo(),
+        check=True,
+        capture_output=True,
+        timeout=300,
+    )
     return output_path
 
 
@@ -82,16 +103,21 @@ def normalize_audio_loudness(ffmpeg_path, input_path, output_path, sample_rate=1
         '-af', 'loudnorm=I=-18:TP=-1.5:LRA=11',
         '-ac', '1', '-ar', str(sample_rate), '-c:a', 'pcm_s16le', output_path
     ]
-    subprocess.run(cmd, startupinfo=hidden_startupinfo(), check=True, capture_output=True)
+    subprocess.run(
+        cmd,
+        startupinfo=hidden_startupinfo(),
+        check=True,
+        capture_output=True,
+        timeout=300,
+    )
     return output_path
 
 
 def play_audio(path):
-    if os.name == 'nt' and os.path.exists(path):
-        os.startfile(os.path.abspath(path))
+    if os.path.exists(path):
+        open_path(path)
 
 
 def open_output_dir(path):
     os.makedirs(path, exist_ok=True)
-    if os.name == 'nt':
-        os.startfile(os.path.abspath(path))
+    open_path(path)

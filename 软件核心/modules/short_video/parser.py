@@ -401,19 +401,51 @@ def _snapshot_files(output_dir):
 
 def _newest_created_file(output_dir, before):
     after = _snapshot_files(output_dir)
-    new_files = [path for path in after if path not in before or after[path] > before.get(path, 0)]
+    temporary_suffixes = (".part", ".ytdl", ".tmp")
+    new_files = [
+        path
+        for path in after
+        if (path not in before or after[path] > before.get(path, 0))
+        and not path.lower().endswith(temporary_suffixes)
+    ]
     if not new_files:
         return ""
     return max(new_files, key=lambda path: os.path.getmtime(path))
 
 
+def _remove_file_quietly(path):
+    try:
+        if path and os.path.isfile(path):
+            os.remove(path)
+    except OSError:
+        pass
+
+
+def _download_page_candidates(info):
+    candidates = []
+    for value in (
+        info.get("expanded_url"),
+        info.get("source_url"),
+        info.get("webpage_url"),
+    ):
+        value = str(value or "").strip()
+        if value and value not in candidates:
+            candidates.append(value)
+    return candidates
+
+
 def _direct_download(url, output_path):
     with requests.get(url, headers=MOBILE_HEADERS, stream=True, timeout=60) as res:
         res.raise_for_status()
+        content_type = str(res.headers.get("Content-Type") or "").lower()
+        if "text/html" in content_type or "application/json" in content_type:
+            raise ShortVideoError("平台直链返回的不是视频文件，链接可能已经失效。")
         with open(output_path, "wb") as f:
             for chunk in res.iter_content(chunk_size=1024 * 256):
                 if chunk:
                     f.write(chunk)
+    if not os.path.isfile(output_path) or os.path.getsize(output_path) <= 0:
+        raise ShortVideoError("平台直链未返回有效视频文件。")
     return output_path
 
 
@@ -434,29 +466,43 @@ def download_short_video(info, output_dir, ffmpeg_location="", kind="video", coo
         raise ShortVideoError(f"缺少 yt-dlp 下载组件，请先安装依赖。底层信息：{exc}")
 
     os.makedirs(output_dir, exist_ok=True)
-    url = info.get("webpage_url") or info.get("expanded_url") or info.get("source_url")
+    page_urls = _download_page_candidates(info)
     direct_url = info.get("direct_download_url") or ""
-    if not url:
+    if not direct_url and not page_urls:
         raise ShortVideoError("缺少可下载链接，请先解析视频。")
 
     title = safe_filename(info.get("caption") or info.get("title") or "短视频")
     stamp = time.strftime("%Y%m%d_%H%M%S")
+    direct_error = ""
     if direct_url:
         if kind == "video":
             output_path = os.path.join(output_dir, f"{title}_{stamp}.mp4")
-            return _direct_download(direct_url, output_path)
-        if not ffmpeg_location or not os.path.exists(ffmpeg_location):
-            raise ShortVideoError("缺少 ffmpeg，无法从抖音直链提取音频。")
-        output_path = os.path.join(output_dir, f"{title}_{stamp}.mp3")
-        _run_ffmpeg([
-            ffmpeg_location,
-            "-y", "-hide_banner", "-loglevel", "error",
-            "-headers", "User-Agent: " + MOBILE_HEADERS["User-Agent"] + "\r\nReferer: https://www.douyin.com/\r\n",
-            "-i", direct_url,
-            "-vn", "-c:a", "libmp3lame", "-b:a", "192k",
-            output_path,
-        ])
-        return output_path
+            try:
+                return _direct_download(direct_url, output_path)
+            except Exception as exc:
+                direct_error = humanize_ytdlp_error(exc, cookie_options)
+                _remove_file_quietly(output_path)
+        elif not ffmpeg_location or not os.path.exists(ffmpeg_location):
+            direct_error = "缺少 ffmpeg，无法从平台直链提取音频。"
+        else:
+            output_path = os.path.join(output_dir, f"{title}_{stamp}.mp3")
+            try:
+                _run_ffmpeg([
+                    ffmpeg_location,
+                    "-y", "-hide_banner", "-loglevel", "error",
+                    "-headers", "User-Agent: " + MOBILE_HEADERS["User-Agent"] + "\r\nReferer: https://www.douyin.com/\r\n",
+                    "-i", direct_url,
+                    "-vn", "-c:a", "libmp3lame", "-b:a", "192k",
+                    output_path,
+                ])
+                return output_path
+            except Exception as exc:
+                direct_error = humanize_ytdlp_error(exc, cookie_options)
+                _remove_file_quietly(output_path)
+
+    if not page_urls:
+        action = "原视频下载" if kind == "video" else "音频下载"
+        raise ShortVideoError(f"{action}失败，平台临时直链已经失效，请重新解析后再试。底层信息：{direct_error}")
 
     outtmpl = os.path.join(output_dir, f"{title}_{stamp}.%(ext)s")
     before = _snapshot_files(output_dir)
@@ -467,6 +513,10 @@ def download_short_video(info, output_dir, ffmpeg_location="", kind="video", coo
         "noplaylist": True,
         "outtmpl": outtmpl,
         "socket_timeout": 30,
+        "http_headers": HEADERS,
+        "extractor_retries": 3,
+        "fragment_retries": 3,
+        "retries": 3,
     }
     common = _apply_cookie_options(common, cookie_options)
     if ffmpeg_location and os.path.exists(ffmpeg_location):
@@ -487,15 +537,24 @@ def download_short_video(info, output_dir, ffmpeg_location="", kind="video", coo
             "merge_output_format": "mp4",
         })
 
-    try:
-        with YoutubeDL(common) as ydl:
-            ydl.extract_info(url, download=True)
-    except Exception as exc:
-        if kind == "video":
-            raise ShortVideoError(f"原视频下载失败，请重新解析后再试。底层信息：{humanize_ytdlp_error(exc, cookie_options)}")
-        raise ShortVideoError(f"音频下载失败，请重新解析后再试。底层信息：{humanize_ytdlp_error(exc, cookie_options)}")
+    page_errors = []
+    for page_url in page_urls:
+        try:
+            with YoutubeDL(common) as ydl:
+                ydl.extract_info(page_url, download=True)
+            output = _newest_created_file(output_dir, before)
+            if output and os.path.exists(output):
+                return output
+            page_errors.append(f"{page_url} -> 下载完成但未找到输出文件")
+        except Exception as exc:
+            page_errors.append(f"{page_url} -> {humanize_ytdlp_error(exc, cookie_options)}")
 
-    output = _newest_created_file(output_dir, before)
-    if not output or not os.path.exists(output):
-        raise ShortVideoError("下载完成但未找到输出文件，请检查输出目录权限。")
-    return output
+    action = "原视频下载" if kind == "video" else "音频下载"
+    details = []
+    if direct_error:
+        details.append(f"临时直链失效：{direct_error}")
+    details.extend(page_errors[-3:])
+    raise ShortVideoError(
+        f"{action}失败，已自动尝试临时直链和作品分享页。"
+        f"请重新从手机端复制最新分享链接后再试。底层信息：{'；'.join(details) or '未知错误'}"
+    )

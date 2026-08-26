@@ -136,7 +136,17 @@ class ShortVideoTranscriptWorker(QThread):
             self.progress.emit(60)
             self.message.emit(f"正在用 SenseVoice 识别口播文案，设备：{device}，模型状态：{'已加载' if loaded else '首次加载'}...")
             txt_path = os.path.join(self.output_dir, f"{title}_口播文案_{stamp}.txt")
-            transcribe_to_txt_with_sensevoice(wav_path, self.sensevoice_model_dir, txt_path)
+            transcribe_to_txt_with_sensevoice(
+                wav_path,
+                self.sensevoice_model_dir,
+                txt_path,
+                event_callback=lambda event: self.message.emit(
+                    str(event.get("message") or "")
+                )
+                if event.get("message")
+                else None,
+                context="短视频口播",
+            )
             with open(txt_path, "r", encoding="utf-8", errors="ignore") as f:
                 text = f.read().strip()
             if not text:

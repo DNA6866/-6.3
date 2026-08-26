@@ -5,7 +5,7 @@ import subprocess
 import sys
 import time
 
-from .comfy_manager import check_comfyui_path, is_api_available
+from .comfy_manager import check_comfyui_path, find_python_executable, is_api_available
 from .config import ENV_REPORT_FILE, ensure_dirs
 from .hardware_profile import detect_hardware_profile, profile_summary
 from .workflow_manager import check_required_models, scan_zimage_workflows
@@ -62,6 +62,85 @@ def _output_writable(output_dir):
         return False, str(exc)
 
 
+def _timeout_output(exc):
+    output = getattr(exc, "stdout", None) or getattr(exc, "output", None) or ""
+    if isinstance(output, bytes):
+        return output.decode("utf-8", errors="replace")
+    return str(output)
+
+
+def _last_probe_module(output):
+    current = ""
+    completed = set()
+    for raw_line in (output or "").splitlines():
+        line = raw_line.strip()
+        if line.startswith("PROBE_BEGIN "):
+            current = line.split(" ", 1)[1].strip()
+        elif line.startswith(("PROBE_OK ", "PROBE_FAIL ")):
+            parts = line.split(" ", 2)
+            if len(parts) >= 2:
+                completed.add(parts[1].strip())
+    return "" if current in completed else current
+
+
+def _probe_comfyui_runtime(comfyui_path):
+    python_exe = find_python_executable(comfyui_path)
+    if not python_exe or not os.path.exists(python_exe):
+        return "fail", f"未找到 ComfyUI 内置 Python：{python_exe}"
+    code = (
+        "import importlib\n"
+        "import importlib.util\n"
+        "import time\n"
+        "mods=['aiohttp','yaml','PIL','safetensors','sqlalchemy','alembic',"
+        "'comfyui_frontend_package','comfy_aimdo.control','comfy_kitchen']\n"
+        "missing=[name for name in mods if importlib.util.find_spec(name) is None]\n"
+        "if missing:\n"
+        " print('PROBE_MISSING ' + ','.join(missing), flush=True)\n"
+        " raise SystemExit(3)\n"
+        "failed=[]\n"
+        "for name in mods:\n"
+        " print('PROBE_BEGIN ' + name, flush=True)\n"
+        " started=time.perf_counter()\n"
+        " try:\n"
+        "  importlib.import_module(name)\n"
+        "  print(f'PROBE_OK {name} {time.perf_counter()-started:.2f}s', flush=True)\n"
+        " except Exception as exc:\n"
+        "  failed.append(f'{name}: {exc}')\n"
+        "  print(f'PROBE_FAIL {name} {exc}', flush=True)\n"
+        "print('PROBE_COMPLETE' if not failed else '\\n'.join(failed), flush=True)\n"
+        "raise SystemExit(0 if not failed else 2)\n"
+    )
+    try:
+        res = subprocess.run(
+            [python_exe, "-c", code],
+            cwd=comfyui_path,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=90,
+            startupinfo=_hidden_startupinfo(),
+        )
+        output = (res.stdout or "").strip()
+        if res.returncode == 0:
+            timing_lines = [line for line in output.splitlines() if line.startswith("PROBE_OK ")]
+            timing = "；".join(line.replace("PROBE_OK ", "", 1) for line in timing_lines)
+            return "pass", f"{python_exe}；核心依赖可导入；{timing}"
+        return "fail", f"{python_exe}；退出码 {res.returncode}；{output[-1200:] or '无输出'}"
+    except subprocess.TimeoutExpired as exc:
+        output = _timeout_output(exc)
+        current = _last_probe_module(output)
+        detail = f"，当前模块：{current}" if current else ""
+        return (
+            "warn",
+            f"{python_exe}；依赖文件均已找到，但首次导入超过 90 秒{detail}。"
+            "这通常是磁盘读取或安全软件实时扫描较慢，不代表环境损坏",
+        )
+    except Exception as exc:
+        return "fail", f"{python_exe}；探针执行失败：{exc}"
+
+
 def check_environment(config):
     ensure_dirs()
     comfyui_path = config.get("comfyui_path", "")
@@ -73,6 +152,19 @@ def check_environment(config):
     ok, msg = check_comfyui_path(comfyui_path)
     results.append(_result("ComfyUI 路径是否存在", "pass" if ok else "fail", comfyui_path, "" if ok else msg))
     results.append(_result("ComfyUI 主程序 main.py 是否存在", "pass" if os.path.exists(os.path.join(comfyui_path, "main.py")) else "fail", msg))
+    runtime_status, runtime_msg = _probe_comfyui_runtime(comfyui_path)
+    results.append(_result(
+        "ComfyUI 内置 Python 与核心依赖",
+        runtime_status,
+        runtime_msg,
+        (
+            ""
+            if runtime_status == "pass"
+            else "首次加载较慢，可直接点击[启动 ComfyUI]验证；若启动仍失败，请复制包含启动日志的诊断信息。"
+            if runtime_status == "warn"
+            else "内置 AI 环境不完整或被安全软件拦截，请更新网盘资源包中的 ComfyUI 引擎。"
+        ),
+    ))
 
     workflows = scan_zimage_workflows(comfyui_path)
     results.append(_result(
@@ -91,8 +183,22 @@ def check_environment(config):
     ))
 
     profile = detect_hardware_profile(comfyui_path)
-    nvidia_ok, nvidia_info = _query_nvidia()
-    results.append(_result("是否有 nvidia-smi", "pass" if nvidia_ok else "fail", "可调用" if nvidia_ok else "不可调用"))
+    gpu_info = profile.get("gpu", {})
+    torch_info = profile.get("torch", {})
+    source = gpu_info.get("source", "")
+    smi_ok = bool(source and "nvidia-smi" in source.lower())
+    nvidia_ok = bool(gpu_info.get("ok"))
+    nvidia_info = (
+        f"{gpu_info.get('name', '未检测到')} / "
+        f"显存 {round(int(gpu_info.get('vram_mb') or 0) / 1024, 1)}GB / "
+        f"驱动 {gpu_info.get('driver') or '未知'} / "
+        f"来源 {source or '无'}"
+    )
+    results.append(_result(
+        "是否有 nvidia-smi",
+        "pass" if smi_ok else "warn",
+        "可调用" if smi_ok else "不可调用或不在 PATH，已尝试系统/PyTorch 兜底检测",
+    ))
     results.append(_result("是否检测到 NVIDIA 显卡", "pass" if nvidia_ok else "fail", nvidia_info))
     results.append(_result(
         "AI 商品图硬件适配档位",
@@ -101,7 +207,6 @@ def check_environment(config):
         "；".join(profile.get("failures") or profile.get("warnings") or [profile.get("suggestion", "")]),
     ))
 
-    torch_info = profile.get("torch", {})
     torch_ok = bool(torch_info.get("torch_available"))
     results.append(_result("自带 AI 引擎是否有 torch", "pass" if torch_ok else "fail", torch_info.get("torch_version", torch_info.get("error", "未安装"))))
     cuda_available = bool(torch_info.get("cuda_available"))
@@ -120,7 +225,7 @@ def check_environment(config):
         "ComfyUI API 是否可访问",
         "pass" if api_ok else "warn",
         f"http://{host}:{port}" if api_ok else "未启动或不可访问",
-        "" if api_ok else "ComfyUI 未启动时此项会显示警告，可点击“启动 ComfyUI”后重新检测。",
+        "" if api_ok else "ComfyUI 未启动时此项会显示警告，可点击[启动 ComfyUI]后重新检测。",
     ))
 
     final_pass = not any(item["status"] == "fail" for item in results)

@@ -10,8 +10,9 @@ import time
 from packaging.version import Version, InvalidVersion
 
 from paths import tools_dir
-from .config import ENV_REPORT_FILE, OUTPUT_DIR, ZIPENHANCER_MODEL_DIR, ensure_dirs
+from .config import ASR_MODEL_DIR, ENV_REPORT_FILE, OUTPUT_DIR, ZIPENHANCER_MODEL_DIR, ensure_dirs
 from .model_manager import check_model_path
+from .runtime_support import RUNTIME_LOG_FILE, RUNTIME_PYTHON, RUNTIME_SITE_PACKAGES, probe_voice_runtime
 
 
 def _version_ok(current, minimum=None, maximum=None):
@@ -60,7 +61,7 @@ def _find_ffmpeg():
     bundled = os.path.join(tools_dir(), "ffmpeg.exe")
     if os.path.exists(bundled):
         return bundled
-    return shutil.which("ffmpeg") or ""
+    return ""
 
 
 def _query_gpu():
@@ -159,28 +160,43 @@ def check_environment(model_path, output_dir=None):
     ))
 
     py_version = ".".join(str(x) for x in sys.version_info[:3])
-    runtime_path = sys.executable
+    app_runtime_path = sys.executable
     results.append(_result(
-        "当前软件实际使用的 Python/EXE",
+        "主程序 Python/EXE",
         "pass",
-        runtime_path,
-        "音频克隆检测的是牛爷爷软件当前运行环境，不会自动复用 ComfyUI 的 Python 环境。",
-    ))
-    py_ok = sys.version_info >= (3, 10) and sys.version_info < (3, 13)
-    results.append(_result(
-        "Python 版本是否满足 >=3.10 且 <3.13",
-        "pass" if py_ok else "fail",
-        py_version,
-        "" if py_ok else "VoxCPM2 官方要求 Python >=3.10 且 <3.13。",
+        app_runtime_path,
+        "主程序仅负责 UI；VoxCPM2 已改为独立 AI 子进程运行。",
     ))
 
-    torch_ok, torch_version = _module_version("torch")
+    runtime_ok, runtime_info = probe_voice_runtime()
+    runtime_python_version = runtime_info.get("python_version", "未知")
+    results.append(_result(
+        "音频克隆独立 AI Python",
+        "pass" if os.path.isfile(RUNTIME_PYTHON) else "fail",
+        RUNTIME_PYTHON,
+        "" if os.path.isfile(RUNTIME_PYTHON) else "缺少网盘资源包中的 ComfyUI Python 环境。",
+    ))
+    results.append(_result(
+        "音频克隆运行层",
+        "pass" if os.path.isdir(RUNTIME_SITE_PACKAGES) else "fail",
+        RUNTIME_SITE_PACKAGES,
+        "" if os.path.isdir(RUNTIME_SITE_PACKAGES) else "缺少 engines/voice_clone/site-packages 运行层，请使用最新累计更新包。",
+    ))
+    py_ok = runtime_ok and runtime_python_version != "未知"
+    results.append(_result(
+        "独立 AI Python 是否可启动",
+        "pass" if py_ok else "fail",
+        runtime_python_version,
+        "" if py_ok else runtime_info.get("error", "独立 AI Python 启动失败。"),
+    ))
+    torch_version = runtime_info.get("torch", "未安装")
+    torch_ok = runtime_ok and torch_version != "未安装"
     torch_version_ok = torch_ok and _version_ok(torch_version, "2.5.0")
     results.append(_result(
-        "是否安装 torch",
+        "独立 AI 环境是否安装 torch",
         "pass" if torch_ok else "fail",
-        torch_version if torch_ok else "未安装",
-        "" if torch_ok else "当前软件运行环境未安装 PyTorch。ComfyUI 已安装不代表本软件环境已安装，请给牛爷爷软件环境安装适配显卡的 PyTorch GPU 版本。",
+        torch_version,
+        "" if torch_ok else runtime_info.get("error", "独立 AI 环境缺少 PyTorch。"),
     ))
     results.append(_result(
         "torch 版本是否 >=2.5.0",
@@ -189,20 +205,13 @@ def check_environment(model_path, output_dir=None):
         "" if torch_version_ok else "VoxCPM2 官方要求 PyTorch >= 2.5.0。",
     ))
 
-    cuda_available = False
-    cuda_version = "未知"
-    if torch_ok:
-        try:
-            import torch
-            cuda_available = bool(torch.cuda.is_available())
-            cuda_version = getattr(torch.version, "cuda", "") or "CPU版本"
-        except Exception:
-            cuda_available = False
+    cuda_available = bool(runtime_info.get("cuda_available"))
+    cuda_version = runtime_info.get("cuda_version") or "未知"
     results.append(_result(
         "torch.cuda.is_available() 是否为 True",
         "pass" if cuda_available else "fail",
         str(cuda_available),
-        "" if cuda_available else "当前软件运行环境里的 PyTorch 无法调用 GPU，可能安装成了 CPU 版本；这和 ComfyUI 能否运行不是同一个环境。",
+        "" if cuda_available else runtime_info.get("error", "独立 AI 环境里的 PyTorch 无法调用 GPU。"),
     ))
     results.append(_result(
         "CUDA 是否可用",
@@ -211,18 +220,26 @@ def check_environment(model_path, output_dir=None):
         "" if cuda_available else "请确认 NVIDIA 驱动正常，并安装匹配 CUDA 的 PyTorch GPU 版本。",
     ))
 
-    for module_name, label in [
-        ("torchaudio", "torchaudio 是否可用"),
-        ("voxcpm", "voxcpm 是否可用"),
-        ("soundfile", "soundfile 是否可用"),
-    ]:
-        ok, version_or_error = _module_version(module_name)
-        results.append(_result(
-            label,
-            "pass" if ok else "fail",
-            version_or_error if ok else "不可用",
-            "" if ok else f"当前软件运行环境缺少 {module_name}。如果 ComfyUI 里有这个库，也不会自动给本软件使用，请安装到牛爷爷软件的运行环境中。",
-        ))
+    results.append(_result(
+        "VoxCPM2 独立运行依赖",
+        "pass" if runtime_ok else "fail",
+        (
+            f"torchaudio {runtime_info.get('torchaudio', '未知')}；"
+            f"transformers {runtime_info.get('transformers', '未知')}；"
+            f"voxcpm {runtime_info.get('voxcpm_file', '未找到')}"
+        ),
+        "" if runtime_ok else runtime_info.get("error", "音频克隆独立运行依赖不完整。"),
+    ))
+    asr_runtime_ok = runtime_ok and bool(runtime_info.get("funasr")) and bool(runtime_info.get("modelscope"))
+    results.append(_result(
+        "参考音频文字稿识别依赖",
+        "pass" if asr_runtime_ok else "fail",
+        (
+            f"funasr {runtime_info.get('funasr', '未安装')}；"
+            f"modelscope {runtime_info.get('modelscope', '未安装')}"
+        ),
+        "" if asr_runtime_ok else "独立 AI 环境缺少 SenseVoice 运行依赖，请更新网盘资源包中的 ComfyUI Python 环境。",
+    ))
 
     ffmpeg = _find_ffmpeg()
     results.append(_result(
@@ -244,6 +261,13 @@ def check_environment(model_path, output_dir=None):
         "pass" if model_ok else "fail",
         model_msg,
         "" if model_ok else "请确认选择的是完整的 VoxCPM2 模型目录，不要只选择上一级文件夹。",
+    ))
+    asr_model_ok = os.path.isfile(os.path.join(ASR_MODEL_DIR, "model.pt"))
+    results.append(_result(
+        "SenseVoiceSmall 文字稿模型",
+        "pass" if asr_model_ok else "fail",
+        ASR_MODEL_DIR if asr_model_ok else "未找到或模型不完整",
+        "" if asr_model_ok else "请把完整 SenseVoiceSmall 模型放入网盘资源包/models/SenseVoiceSmall。",
     ))
 
     zipenhancer_ok = os.path.isdir(ZIPENHANCER_MODEL_DIR)
@@ -289,9 +313,12 @@ def build_report(results, model_path, output_dir, gpu, model_files):
         "",
         "【系统信息】",
         f"系统信息：{platform.platform()}",
-        f"当前软件运行环境：{sys.executable}",
-        "说明：AI音频克隆检测的是牛爷爷软件当前运行环境，不会自动复用 ComfyUI 的 Python/venv。",
-        f"Python 版本：{'.'.join(str(x) for x in sys.version_info[:3])}",
+        f"主程序运行环境：{sys.executable}",
+        f"音频克隆独立 AI Python：{RUNTIME_PYTHON}",
+        f"音频克隆运行层：{RUNTIME_SITE_PACKAGES}",
+        f"音频克隆运行日志：{RUNTIME_LOG_FILE}",
+        "说明：主程序只负责界面，VoxCPM2 与 SenseVoiceSmall 均在独立 AI 子进程中运行。",
+        f"主程序 Python 版本：{'.'.join(str(x) for x in sys.version_info[:3])}",
         "",
         "【显卡信息】",
         f"显卡信息：{gpu.get('gpu_name') or '未检测到'}",
@@ -301,6 +328,7 @@ def build_report(results, model_path, output_dir, gpu, model_files):
         "",
         "【模型与输出】",
         f"VoxCPM2 模型路径：{model_path}",
+        f"SenseVoiceSmall 模型路径：{ASR_MODEL_DIR}",
         f"ZipEnhancer 降噪模型路径：{ZIPENHANCER_MODEL_DIR}",
         f"输出目录：{output_dir}",
         f"模型文件总数：{model_files.get('total_files', 0)}",

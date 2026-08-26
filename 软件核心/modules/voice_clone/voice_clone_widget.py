@@ -1,13 +1,14 @@
+import hashlib
 import os
-import wave
+import subprocess
+import time
+import traceback
 
-from PyQt5.QtCore import QByteArray, QBuffer, QIODevice, Qt, QTimer, pyqtSignal
+from PyQt5.QtCore import Qt, QTimer, pyqtSignal
 from PyQt5.QtGui import QBrush, QColor, QPainter, QPen
-from PyQt5.QtMultimedia import QAudio, QAudioDeviceInfo, QAudioFormat, QAudioOutput
 from PyQt5.QtWidgets import (
     QFileDialog,
     QDoubleSpinBox,
-    QFrame,
     QGridLayout,
     QGroupBox,
     QHBoxLayout,
@@ -18,6 +19,7 @@ from PyQt5.QtWidgets import (
     QPushButton,
     QProgressBar,
     QCheckBox,
+    QComboBox,
     QSpinBox,
     QStyle,
     QTabWidget,
@@ -28,13 +30,15 @@ from PyQt5.QtWidgets import (
     QWidget,
 )
 
-from paths import tools_dir
+from paths import tools_dir, workspace_path
 from services.media_service import build_waveform_peaks
+from services.platform_service import open_path
+from ui_components import configure_spinbox_for_direct_input
 
 from .audio_tools import extract_audio_from_media, get_media_duration, make_output_path, open_output_dir, play_audio
-from .config import APP_ROOT, ENV_REPORT_FILE, OUTPUT_DIR, ZIPENHANCER_MODEL_DIR, load_config, save_config
+from .config import ENV_REPORT_FILE, OUTPUT_DIR, ZIPENHANCER_MODEL_DIR, load_config, save_config
 from .model_manager import check_model_path
-from .task_worker import AudioPrepareWorker, BatchGenerateWorker, EnvCheckWorker, ReferenceTranscribeWorker, VoiceGenerateWorker
+from .task_worker import BatchGenerateWorker, EnvCheckWorker, ReferenceTranscribeWorker, VoiceGenerateWorker
 
 
 class ReferenceWaveform(QWidget):
@@ -213,47 +217,45 @@ class ReferenceWaveform(QWidget):
 
 
 class AudioPreviewPanel(QWidget):
-    """统一音频预览、播放和框选裁剪控件。"""
+    """音频预览、播放和框选裁剪控件。使用 ffplay 后台播放，确保音频与进度精准同步。"""
 
     selectionChanged = pyqtSignal(float, float)
 
     def __init__(self, title="参考音频预览", parent=None):
         super().__init__(parent)
         self.audio_path = ""
-        self.preview_wav_path = ""
         self.duration_ms = 0
+        self._ffplay_process = None
         self._loop_selection = True
-        self._audio_output = None
-        self._audio_buffer = None
-        self._audio_data = QByteArray()
-        self._audio_bytes_per_ms = 0.0
         self._play_start_ms = 0
-        self._paused = False
-        self.setFixedHeight(122)
+        self._play_end_ms = 0
+        self._is_playing = False
+        self._tick_start = 0.0
+        self.setMinimumHeight(130)
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(5)
+        layout.setSpacing(4)
 
         self.title_label = QLabel(title)
         self.title_label.setObjectName("mutedText")
         self.info_label = QLabel("尚未选择音频")
         self.info_label.setObjectName("mutedText")
-        self.info_label.setMaximumHeight(20)
+        self.info_label.setMaximumHeight(26)
         self.waveform = ReferenceWaveform()
         self.waveform.selectionChanged.connect(self._on_waveform_selection_changed)
 
         self.timer = QTimer(self)
-        self.timer.setInterval(15)
-        self.timer.timeout.connect(self.refresh_preview)
+        self.timer.setInterval(50)
+        self.timer.timeout.connect(self._tick_progress)
 
         self.play_btn = QPushButton("播放选区")
         self.play_btn.setIcon(self.style().standardIcon(QStyle.SP_MediaPlay))
-        self.play_btn.setFixedHeight(28)
+        self.play_btn.setMinimumHeight(34)
         self.play_btn.clicked.connect(self.toggle_playback)
         self.stop_btn = QPushButton("停止")
         self.stop_btn.setIcon(self.style().standardIcon(QStyle.SP_MediaStop))
-        self.stop_btn.setFixedHeight(28)
+        self.stop_btn.setMinimumHeight(34)
         self.stop_btn.clicked.connect(self.stop)
         self.time_label = QLabel("00:00 / 00:00")
         self.time_label.setObjectName("mutedText")
@@ -271,13 +273,11 @@ class AudioPreviewPanel(QWidget):
         layout.addWidget(self.waveform)
         layout.addLayout(controls)
 
+    # ───── 音频加载 ─────
     def set_audio(self, audio_path):
         self.stop()
         self.audio_path = audio_path or ""
-        self.preview_wav_path = ""
         self.duration_ms = 0
-        self._audio_data = QByteArray()
-        self._audio_bytes_per_ms = 0.0
         self.waveform.set_peaks([])
         self.waveform.set_progress(0)
         if not self.audio_path or not os.path.exists(self.audio_path):
@@ -288,10 +288,9 @@ class AudioPreviewPanel(QWidget):
         name = os.path.basename(self.audio_path)
         size_mb = os.path.getsize(self.audio_path) / 1024 / 1024
         ffprobe = os.path.join(tools_dir(), "ffprobe.exe")
-        duration = get_media_duration(ffprobe if os.path.exists(ffprobe) else "ffprobe", self.audio_path)
+        duration = get_media_duration(ffprobe, self.audio_path) if os.path.exists(ffprobe) else 0
         if duration > 0:
             self.duration_ms = int(duration * 1000)
-        self._prepare_pcm_preview()
         self.info_label.setText(f"{name}    {size_mb:.2f} MB")
         self._refresh_selection_label()
         self.refresh_preview(0)
@@ -301,6 +300,7 @@ class AudioPreviewPanel(QWidget):
         except Exception:
             self.waveform.set_peaks([])
 
+    # ───── 公共接口 ─────
     def has_audio(self):
         return bool(self.audio_path and os.path.exists(self.audio_path))
 
@@ -308,11 +308,11 @@ class AudioPreviewPanel(QWidget):
         return self.has_audio() and (self.waveform.selection_start > 0.003 or self.waveform.selection_end < 0.997)
 
     def selection_seconds(self):
-        duration = self.duration_ms / 1000 if self.duration_ms else 0
-        if duration <= 0:
+        dur = self.duration_ms / 1000 if self.duration_ms else 0
+        if dur <= 0:
             return 0.0, 0.0
-        start = self.waveform.selection_start * duration
-        end = self.waveform.selection_end * duration
+        start = self.waveform.selection_start * dur
+        end = self.waveform.selection_end * dur
         return max(0.0, start), max(0.0, end - start)
 
     def set_selection_seconds(self, start, duration):
@@ -322,42 +322,115 @@ class AudioPreviewPanel(QWidget):
         end = total if duration <= 0 else min(total, start + duration)
         self.waveform.set_selection(start / total, end / total)
 
+    # ───── ffplay 播放器（解决 QAudioOutput 进度不同步问题）─────
+    @staticmethod
+    def _startupinfo():
+        if os.name == "nt":
+            si = subprocess.STARTUPINFO()
+            si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+            return si
+        return None
+
+    def _kill_ffplay(self):
+        if self._ffplay_process:
+            try:
+                self._ffplay_process.terminate()
+            except Exception:
+                try:
+                    self._ffplay_process.kill()
+                except Exception:
+                    pass
+            self._ffplay_process = None
+
+    def _start_ffplay(self, start_sec, end_sec):
+        self._kill_ffplay()
+        ffplay = os.path.join(tools_dir(), "ffplay.exe")
+        if not os.path.exists(ffplay):
+            ffplay = "ffplay"
+        dur = end_sec - start_sec
+        if dur < 0.05:
+            dur = 0.1
+        cmd = [ffplay, "-nodisp", "-autoexit", "-loglevel", "quiet",
+               "-ss", f"{start_sec:.3f}", "-t", f"{dur:.3f}", self.audio_path]
+        try:
+            self._ffplay_process = subprocess.Popen(
+                cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                startupinfo=self._startupinfo()
+            )
+        except Exception:
+            self._ffplay_process = None
+            return False
+        return True
+
     def toggle_playback(self):
         if not self.has_audio():
             return
-        if self._audio_output and self._audio_output.state() == QAudio.ActiveState:
-            self._audio_output.suspend()
-            self._paused = True
-            self.timer.stop()
-            self.play_btn.setText("继续")
-            self.play_btn.setIcon(self.style().standardIcon(QStyle.SP_MediaPlay))
+        if self._is_playing:
+            self.stop()
             return
-        if self._audio_output and self._audio_output.state() == QAudio.SuspendedState:
-            self._paused = False
-            self._audio_output.resume()
+        start_ms, end_ms = self._selection_ms()
+        start_sec = start_ms / 1000
+        end_sec = end_ms / 1000
+        self._play_start_ms = start_ms
+        self._play_end_ms = end_ms
+        if self._start_ffplay(start_sec, end_sec):
+            self._is_playing = True
+            self._tick_start = time.time()
             self.timer.start()
             self.play_btn.setText("暂停")
             self.play_btn.setIcon(self.style().standardIcon(QStyle.SP_MediaPause))
-            return
-        start_ms, _ = self._selection_ms()
-        self._start_audio_output(start_ms)
+            self.refresh_preview(start_ms)
 
     def stop(self):
         self.timer.stop()
-        if self._audio_output:
-            self._audio_output.stop()
-            self._audio_output.deleteLater()
-            self._audio_output = None
-        if self._audio_buffer:
-            self._audio_buffer.close()
-            self._audio_buffer.deleteLater()
-            self._audio_buffer = None
-        self._play_start_ms = 0
-        self._paused = False
+        self._kill_ffplay()
+        self._is_playing = False
         self.waveform.set_progress(0)
         self.time_label.setText(f"{self._fmt_ms(0)} / {self._fmt_ms(self._duration_ms())}")
         self.play_btn.setText("播放选区")
         self.play_btn.setIcon(self.style().standardIcon(QStyle.SP_MediaPlay))
+
+    def _tick_progress(self):
+        """定时器回调：基于播放开始时间和系统时钟推算进度（不依赖音频 API）"""
+        if not self._is_playing:
+            return
+        elapsed = int((time.time() - self._tick_start) * 1000)
+        position = self._play_start_ms + elapsed
+        if self._loop_selection and position >= self._play_end_ms:
+            # 循环播放：重启 ffplay
+            start_ms = self._play_start_ms
+            end_ms = self._play_end_ms
+            self._restart_ffplay(start_ms / 1000, end_ms / 1000, start_ms, end_ms)
+            return
+        # 检查 ffplay 是否仍在运行
+        if self._ffplay_process and self._ffplay_process.poll() is not None:
+            self.stop()
+            return
+        if position >= self._duration_ms():
+            self.stop()
+            return
+        self.refresh_preview(position)
+
+    def _restart_ffplay(self, start_sec, end_sec, start_ms, end_ms):
+        self._kill_ffplay()
+        self._play_start_ms = start_ms
+        self._play_end_ms = end_ms
+        self._tick_start = time.time()
+        if self._start_ffplay(start_sec, end_sec):
+            self.refresh_preview(start_ms)
+        else:
+            self.stop()
+
+    # ───── 波形选择与进度 ─────
+    def _on_waveform_selection_changed(self, start_ratio, end_ratio):
+        if self._is_playing:
+            self.stop()
+        start_ms, _ = self._selection_ms()
+        self._play_start_ms = start_ms
+        self.refresh_preview(start_ms)
+        self._refresh_selection_label()
+        start, duration = self.selection_seconds()
+        self.selectionChanged.emit(start, duration)
 
     def _selection_ms(self):
         duration = self._duration_ms()
@@ -370,95 +443,21 @@ class AudioPreviewPanel(QWidget):
     def _duration_ms(self):
         return self.duration_ms or 0
 
-    def _prepare_pcm_preview(self):
-        ffmpeg = os.path.join(tools_dir(), "ffmpeg.exe")
-        ffmpeg = ffmpeg if os.path.exists(ffmpeg) else "ffmpeg"
-        self.preview_wav_path = make_output_path(OUTPUT_DIR, "preview_audio", "wav")
-        extract_audio_from_media(ffmpeg, self.audio_path, self.preview_wav_path, start=0, duration=0, sample_rate=48000)
-        with wave.open(self.preview_wav_path, "rb") as wav_file:
-            channels = wav_file.getnchannels()
-            sample_width = wav_file.getsampwidth()
-            sample_rate = wav_file.getframerate()
-            frames = wav_file.getnframes()
-            pcm = wav_file.readframes(frames)
-        if sample_width != 2:
-            raise RuntimeError("预览音频格式不支持，请换用 wav/mp3/m4a 等常见格式。")
-        self._audio_data = QByteArray(pcm)
-        self._audio_bytes_per_ms = sample_rate * channels * sample_width / 1000
-        self.duration_ms = int(frames / sample_rate * 1000) if sample_rate else self.duration_ms
-        self._audio_format = QAudioFormat()
-        self._audio_format.setSampleRate(sample_rate)
-        self._audio_format.setChannelCount(channels)
-        self._audio_format.setSampleSize(sample_width * 8)
-        self._audio_format.setCodec("audio/pcm")
-        self._audio_format.setByteOrder(QAudioFormat.LittleEndian)
-        self._audio_format.setSampleType(QAudioFormat.SignedInt)
-        device = QAudioDeviceInfo.defaultOutputDevice()
-        if not device.isFormatSupported(self._audio_format):
-            self._audio_format = device.nearestFormat(self._audio_format)
-
-    def _start_audio_output(self, start_ms):
-        if self._audio_data.isEmpty():
-            self._prepare_pcm_preview()
-        self.stop()
-        start_ms = max(0, min(int(start_ms), self._duration_ms()))
-        byte_pos = int(start_ms * self._audio_bytes_per_ms)
-        if byte_pos % 2:
-            byte_pos -= 1
-        self._play_start_ms = start_ms
-        self._audio_buffer = QBuffer(self)
-        self._audio_buffer.setData(self._audio_data)
-        self._audio_buffer.open(QIODevice.ReadOnly)
-        self._audio_buffer.seek(max(0, min(byte_pos, self._audio_data.size())))
-        self._audio_output = QAudioOutput(self._audio_format, self)
-        self._audio_output.stateChanged.connect(self._on_audio_state_changed)
-        self._audio_output.start(self._audio_buffer)
-        self.timer.start()
-        self.play_btn.setText("暂停")
-        self.play_btn.setIcon(self.style().standardIcon(QStyle.SP_MediaPause))
-        self.refresh_preview(start_ms)
-
-    def _on_waveform_selection_changed(self, start_ratio, end_ratio):
-        if self._audio_output and self._audio_output.state() == QAudio.ActiveState:
-            self._audio_output.suspend()
-            self._paused = True
-            self.timer.stop()
-        start_ms, _ = self._selection_ms()
-        self._play_start_ms = start_ms
-        self.refresh_preview(start_ms)
-        self._refresh_selection_label()
-        start, duration = self.selection_seconds()
-        self.selectionChanged.emit(start, duration)
-
-    def _on_audio_state_changed(self, state):
-        if state in (QAudio.IdleState, QAudio.StoppedState) and not self._paused:
-            self.timer.stop()
-            self.play_btn.setText("播放选区")
-            self.play_btn.setIcon(self.style().standardIcon(QStyle.SP_MediaPlay))
-
     def refresh_preview(self, position=None):
         duration = self._duration_ms()
         if position is None:
-            if self._audio_output and self._audio_output.state() in (QAudio.ActiveState, QAudio.SuspendedState):
-                position = self._play_start_ms + int(self._audio_output.processedUSecs() / 1000)
-            else:
-                position = self._play_start_ms
-        if duration > 0 and self._audio_output and self._audio_output.state() == QAudio.ActiveState:
-            start_ms, end_ms = self._selection_ms()
-            if self._loop_selection and end_ms > start_ms and position >= end_ms:
-                self._start_audio_output(start_ms)
-                return
-        position = max(0, min(int(position or 0), duration or int(position or 0)))
+            position = 0
+        position = max(0, min(int(position), duration))
         if duration > 0:
             self.waveform.set_progress(position / duration)
         self.time_label.setText(f"{self._fmt_ms(position)} / {self._fmt_ms(duration)}")
 
     def _refresh_selection_label(self):
-        start, duration = self.selection_seconds()
+        start, dur = self.selection_seconds()
         if not self.has_audio() or not self.has_custom_selection():
             self.selection_label.setText("选区：全部")
         else:
-            self.selection_label.setText(f"选区：{start:.2f}s - {start + duration:.2f}s")
+            self.selection_label.setText(f"选区：{start:.2f}s - {start + dur:.2f}s")
 
     def _fmt_ms(self, value):
         total = max(0, int(value // 1000))
@@ -468,16 +467,24 @@ class AudioPreviewPanel(QWidget):
 class VoiceCloneWidget(QWidget):
     """AI音频克隆功能区，UI 与真实推理逻辑分离。"""
 
+    log_signal = pyqtSignal(str)
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self.config = load_config()
         self.env_worker = None
         self.generate_worker = None
         self.transcribe_worker = None
-        self.audio_prepare_worker = None
         self.batch_worker = None
+        self._ultimate_transcribe_signature = None
+        self._ultimate_transcript_signature = None
+        self._ultimate_transcribe_used_selection = False
         self._build_ui()
+        configure_spinbox_for_direct_input(self)
         self._load_config_to_ui()
+
+    def _log(self, message):
+        self.log_signal.emit(f"[AI音频克隆] {message}")
 
     def _build_ui(self):
         root = QVBoxLayout(self)
@@ -510,7 +517,6 @@ class VoiceCloneWidget(QWidget):
 
         self.tabs = QTabWidget()
         self.tabs.addTab(self._build_tts_tab(), "文本转语音")
-        self.tabs.addTab(self._build_audio_tools_tab(), "参考音频工具")
         self.tabs.addTab(self._build_clone_tab(), "参考音频克隆")
         self.tabs.addTab(self._build_ultimate_tab(), "高相似克隆")
         self.tabs.addTab(self._build_batch_tab(), "批量生成")
@@ -603,6 +609,24 @@ class VoiceCloneWidget(QWidget):
         line.addStretch(1)
         return box, normalize_chk, denoise_chk
 
+    def _voice_presets(self):
+        return [
+            ("自定义输入", ""),
+            ("电商带货女声", "年轻女性，清晰有亲和力，语速自然，适合电商直播带货"),
+            ("电商带货男声", "年轻男性，干净有活力，表达利落，适合产品讲解和促单"),
+            ("自然年轻女性", "年轻女性，自然温柔，声音干净，情绪轻松"),
+            ("甜美种草女声", "甜美女声，亲切有感染力，适合种草分享和好物推荐"),
+            ("专业广告旁白", "专业广告旁白，吐字清晰，节奏稳定，有高级感"),
+            ("沉稳男声讲解", "成熟男性，沉稳可信，适合品牌介绍和产品参数讲解"),
+            ("客服说明女声", "成熟女性，耐心清楚，语气温和，适合售后说明和教程"),
+            ("直播促单快节奏", "有活力的直播口播，节奏稍快，情绪积极，适合限时促销"),
+        ]
+
+    def _on_tts_preset_changed(self, index):
+        preset = self.tts_voice_preset.itemData(index)
+        if preset:
+            self.tts_voice_desc.setText(preset)
+
     def _build_tts_tab(self):
         page = QWidget()
         layout = QGridLayout(page)
@@ -610,8 +634,21 @@ class VoiceCloneWidget(QWidget):
 
         self.tts_text = QTextEdit()
         self.tts_text.setPlaceholderText("输入要生成的中文或英文文本")
+        self.tts_voice_preset = QComboBox()
+        for name, prompt in self._voice_presets():
+            self.tts_voice_preset.addItem(name, prompt)
         self.tts_voice_desc = QLineEdit()
-        self.tts_voice_desc.setPlaceholderText("例如：年轻女性，温柔，自然，适合电商直播")
+        self.tts_voice_desc.setPlaceholderText("可手动输入，也可以先从左侧选择预设")
+        self.tts_voice_preset.currentIndexChanged.connect(self._on_tts_preset_changed)
+        voice_box = QWidget()
+        voice_layout = QHBoxLayout(voice_box)
+        voice_layout.setContentsMargins(0, 0, 0, 0)
+        voice_layout.addWidget(self.tts_voice_preset)
+        voice_layout.addWidget(self.tts_voice_desc, 1)
+        self.tts_rounds = QSpinBox()
+        self.tts_rounds.setRange(1, 100)
+        self.tts_rounds.setValue(1)
+        self.tts_rounds.setToolTip("一次点击连续生成多少条音频。适合需要多版声音供挑选时使用。")
         param_box, self.tts_cfg, self.tts_steps = self._build_param_line()
         advanced_box, self.tts_normalize, self.tts_denoise_unused = self._build_advanced_line(denoise=False)
         self.tts_generate_btn = QPushButton("生成文本转语音")
@@ -627,92 +664,16 @@ class VoiceCloneWidget(QWidget):
 
         layout.addWidget(QLabel("文本输入"), 0, 0)
         layout.addWidget(self.tts_text, 0, 1, 1, 3)
-        self._row("声音描述", self.tts_voice_desc, 1, layout)
-        self._row("推理参数", param_box, 2, layout)
-        self._row("高级选项", advanced_box, 3, layout)
-        layout.addWidget(self.tts_generate_btn, 4, 1)
-        layout.addWidget(self.tts_progress, 4, 2, 1, 2)
-        self._row("输出文件", self.tts_output, 5, layout)
-        layout.addWidget(listen_btn, 5, 2)
-        layout.addWidget(open_btn, 5, 3)
-        layout.setRowStretch(6, 1)
-        return page
-
-    def _build_audio_tools_tab(self):
-        page = QWidget()
-        layout = QGridLayout(page)
-        layout.setColumnStretch(1, 1)
-
-        self.prepare_input = QLineEdit()
-        self.prepare_input.setReadOnly(True)
-        choose_btn = QPushButton("选择音视频文件")
-        choose_btn.clicked.connect(self.choose_prepare_input)
-
-        self.prepare_start = QDoubleSpinBox()
-        self.prepare_start.setRange(0, 999999)
-        self.prepare_start.setDecimals(2)
-        self.prepare_start.setSuffix(" 秒")
-        self.prepare_duration = QDoubleSpinBox()
-        self.prepare_duration.setRange(0, 3600)
-        self.prepare_duration.setDecimals(2)
-        self.prepare_duration.setValue(30)
-        self.prepare_duration.setSuffix(" 秒")
-        self.prepare_normalize = QCheckBox("统一音量")
-        self.prepare_normalize.setChecked(True)
-        self.prepare_preview = AudioPreviewPanel("输入音视频预览与裁剪")
-        self.prepare_preview.selectionChanged.connect(self.on_prepare_selection_changed)
-        self.prepare_start.valueChanged.connect(self.on_prepare_spin_changed)
-        self.prepare_duration.valueChanged.connect(self.on_prepare_spin_changed)
-
-        trim_box = QWidget()
-        trim_line = QHBoxLayout(trim_box)
-        trim_line.setContentsMargins(0, 0, 0, 0)
-        trim_line.addWidget(QLabel("开始"))
-        trim_line.addWidget(self.prepare_start)
-        trim_line.addSpacing(18)
-        trim_line.addWidget(QLabel("时长"))
-        trim_line.addWidget(self.prepare_duration)
-        trim_line.addSpacing(18)
-        trim_line.addWidget(self.prepare_normalize)
-        trim_line.addStretch(1)
-
-        self.prepare_status = QLabel("建议选择 10-30 秒清晰人声片段；可以从视频里直接提取音频。")
-        self.prepare_status.setObjectName("mutedText")
-        self.prepare_progress = QProgressBar()
-        self.prepare_output = QLineEdit()
-        self.prepare_output.setReadOnly(True)
-        self.prepare_btn = QPushButton("提取/裁剪为参考音频")
-        self.prepare_btn.clicked.connect(self.prepare_reference_audio)
-        to_clone_btn = QPushButton("设为普通克隆参考音频")
-        to_clone_btn.clicked.connect(self.set_prepared_audio_to_clone)
-        to_ultimate_btn = QPushButton("设为高相似参考音频")
-        to_ultimate_btn.clicked.connect(self.set_prepared_audio_to_ultimate)
-        listen_btn = QPushButton("试听处理结果")
-        listen_btn.clicked.connect(lambda: self.listen_audio(self.prepare_output.text()))
-        open_btn = QPushButton("打开输出目录")
-        open_btn.clicked.connect(self.open_output)
-
-        tip = QLabel("这个工具参考雨落版的工作流：先从视频/音频里截取干净的人声，再送去普通克隆或高相似克隆。时长填 0 表示从开始位置截到结尾。")
-        tip.setObjectName("mutedText")
-        tip.setWordWrap(True)
-
-        layout.addWidget(QLabel("输入文件"), 0, 0)
-        layout.addWidget(self.prepare_input, 0, 1, 1, 2)
-        layout.addWidget(choose_btn, 0, 3)
-        layout.addWidget(QLabel("预览裁剪"), 1, 0)
-        layout.addWidget(self.prepare_preview, 1, 1, 1, 3)
-        layout.setRowMinimumHeight(1, 126)
-        self._row("截取参数", trim_box, 2, layout)
-        layout.addWidget(self.prepare_btn, 3, 1)
-        layout.addWidget(self.prepare_progress, 3, 2, 1, 2)
-        self._row("处理状态", self.prepare_status, 4, layout)
-        self._row("输出音频", self.prepare_output, 5, layout)
-        layout.addWidget(listen_btn, 5, 2)
-        layout.addWidget(open_btn, 5, 3)
-        layout.addWidget(to_clone_btn, 6, 1)
-        layout.addWidget(to_ultimate_btn, 6, 2)
-        layout.addWidget(tip, 7, 1, 1, 3)
-        layout.setRowStretch(8, 1)
+        self._row("声音描述", voice_box, 1, layout)
+        self._row("生成轮数", self.tts_rounds, 2, layout)
+        self._row("推理参数", param_box, 3, layout)
+        self._row("高级选项", advanced_box, 4, layout)
+        layout.addWidget(self.tts_generate_btn, 5, 1)
+        layout.addWidget(self.tts_progress, 5, 2, 1, 2)
+        self._row("输出文件", self.tts_output, 6, layout)
+        layout.addWidget(listen_btn, 6, 2)
+        layout.addWidget(open_btn, 6, 3)
+        layout.setRowStretch(7, 1)
         return page
 
     def _build_clone_tab(self):
@@ -777,6 +738,7 @@ class VoiceCloneWidget(QWidget):
         self.ultimate_transcript.setPlaceholderText("选择参考音频后会自动识别文字稿，识别完成后可在这里校对微调。")
         self.ultimate_transcript.setMinimumHeight(86)
         self.ultimate_transcript.setMaximumHeight(110)
+        self.ultimate_transcript.textChanged.connect(self._on_ultimate_transcript_edited)
         self.ultimate_text = QTextEdit()
         self.ultimate_text.setPlaceholderText("输入要生成的新文本")
         self.ultimate_text.setMinimumHeight(72)
@@ -795,7 +757,10 @@ class VoiceCloneWidget(QWidget):
         self.ultimate_transcribe_status = QLabel("")
         self.ultimate_transcribe_status.setObjectName("mutedText")
 
-        tip = QLabel("高相似克隆会自动识别参考音频文字稿，但建议生成前人工快速校对一次，文字稿越准，相似度越稳定。")
+        tip = QLabel(
+            "拖动波形蓝色选区后，重新识别和高相似克隆都会使用该选区的临时裁剪；"
+            "原始参考音频不会被替换或修改。文字稿越准确，相似度越稳定。"
+        )
         tip.setObjectName("mutedText")
         tip.setWordWrap(True)
 
@@ -902,7 +867,7 @@ class VoiceCloneWidget(QWidget):
         save_config(self.config)
 
     def choose_model_dir(self):
-        path = QFileDialog.getExistingDirectory(self, "选择 VoxCPM2 模型目录", self.model_path_edit.text() or os.getcwd())
+        path = QFileDialog.getExistingDirectory(self, "选择 VoxCPM2 模型目录", self.model_path_edit.text() or workspace_path())
         if not path:
             return
         self.model_path_edit.setText(path)
@@ -924,6 +889,7 @@ class VoiceCloneWidget(QWidget):
         self.env_button.setEnabled(False)
         self.status_label.setText("当前状态：检测中")
         self.env_worker = EnvCheckWorker(self.model_path_edit.text().strip(), self.config.get("output_dir", OUTPUT_DIR))
+        self.env_worker.message.connect(self._log)
         self.env_worker.finished.connect(self.on_env_finished)
         self.env_worker.failed.connect(self.on_env_failed)
         self.env_worker.start()
@@ -933,12 +899,14 @@ class VoiceCloneWidget(QWidget):
         self.status_label.setText("当前状态：环境通过" if passed else "当前状态：环境异常")
         self.status_label.setStyleSheet(f"color: {'#22C55E' if passed else '#EF4444'};")
         self._fill_env_table(results)
+        self._log(f"环境检测完成：{'通过' if passed else '未通过'}；报告：{report_path}")
         QMessageBox.information(self, "环境检测完成", f"检测报告已生成：\n{report_path}")
 
     def on_env_failed(self, message):
         self.env_button.setEnabled(True)
         self.status_label.setText("当前状态：检测失败")
         self.status_label.setStyleSheet("color: #EF4444;")
+        self._log(message)
         QMessageBox.warning(self, "环境检测失败", message)
 
     def _fill_env_table(self, results):
@@ -962,7 +930,7 @@ class VoiceCloneWidget(QWidget):
         if not os.path.exists(ENV_REPORT_FILE):
             QMessageBox.information(self, "暂无报告", "还没有检测报告，请先点击“检测运行环境”。")
             return
-        os.startfile(os.path.abspath(ENV_REPORT_FILE))
+        open_path(ENV_REPORT_FILE)
 
     def choose_reference_audio(self):
         path = self._choose_audio_to(self.clone_ref_audio)
@@ -978,7 +946,11 @@ class VoiceCloneWidget(QWidget):
         self.config["last_reference_audio"] = path
         save_config(self.config)
         self.load_ultimate_reference_preview(path)
-        self.start_ultimate_transcribe()
+        try:
+            self.start_ultimate_transcribe()
+        except Exception:
+            traceback.print_exc()
+            print('[音频克隆] 自动识别启动失败，可手动点击"重新识别文字稿"', flush=True)
 
     def choose_batch_reference_audio(self):
         path = self._choose_audio_to(self.batch_ref_audio)
@@ -988,90 +960,232 @@ class VoiceCloneWidget(QWidget):
     def load_ultimate_reference_preview(self, audio_path):
         self.ultimate_preview.set_audio(audio_path)
 
-    def on_prepare_selection_changed(self, start, duration):
-        self.prepare_start.blockSignals(True)
-        self.prepare_duration.blockSignals(True)
-        self.prepare_start.setValue(start)
-        self.prepare_duration.setValue(duration)
-        self.prepare_start.blockSignals(False)
-        self.prepare_duration.blockSignals(False)
-        self.prepare_status.setText(f"已框选 {start:.2f}s - {start + duration:.2f}s，可直接提取为参考音频。")
-
-    def on_prepare_spin_changed(self):
-        if hasattr(self, "prepare_preview") and self.prepare_preview.has_audio():
-            self.prepare_preview.set_selection_seconds(self.prepare_start.value(), self.prepare_duration.value())
-
     def on_ultimate_preview_selection_changed(self, start, duration):
-        message = "参考音频选区已变化，请点击上方“重新识别文字稿”后再生成。"
+        message = (
+            "当前蓝色选区将同时用于文字稿识别和高相似克隆；"
+            "请重新识别文字稿，原始音频不会被修改。"
+        )
         self.ultimate_transcribe_status.setText(message)
         if not self.ultimate_transcript.toPlainText().strip():
             self.ultimate_transcript.setPlaceholderText(message)
 
+    def _current_ultimate_reference_signature(self):
+        if not hasattr(self, 'ultimate_ref_audio'):
+            return None
+        path = (self.ultimate_ref_audio.text() or "").strip()
+        if not path:
+            return None
+        start = 0.0
+        duration = 0.0
+        try:
+            if self.ultimate_preview.has_custom_selection():
+                start, duration = self.ultimate_preview.selection_seconds()
+        except Exception:
+            pass
+        return (
+            os.path.normcase(os.path.abspath(path)),
+            round(float(start or 0.0), 3),
+            round(float(duration or 0.0), 3),
+        )
+
+    def _on_ultimate_transcript_edited(self):
+        self._ultimate_transcript_signature = self._current_ultimate_reference_signature()
+
     def _ffmpeg_path(self):
         bundled = os.path.join(tools_dir(), "ffmpeg.exe")
-        return bundled if os.path.exists(bundled) else "ffmpeg"
+        return bundled if os.path.exists(bundled) else ""
 
     def _reference_audio_for_task(self, line_edit, preview_panel, prefix):
-        path = line_edit.text().strip()
+        path = (line_edit.text() or "").strip() if line_edit else ""
         if not path or not os.path.exists(path):
+            return path if path else ""
+        if not preview_panel:
             return path
-        if not preview_panel or not preview_panel.has_custom_selection():
+        try:
+            has_sel = preview_panel.has_custom_selection()
+        except Exception:
             return path
-        if os.path.abspath(preview_panel.audio_path) != os.path.abspath(path):
+        if not has_sel:
             return path
-        start, duration = preview_panel.selection_seconds()
-        output_path = make_output_path(self.config.get("output_dir", OUTPUT_DIR), prefix, "wav")
-        extract_audio_from_media(self._ffmpeg_path(), path, output_path, start=start, duration=duration, sample_rate=16000)
-        line_edit.setText(output_path)
-        preview_panel.set_audio(output_path)
+        try:
+            preview_audio = getattr(preview_panel, 'audio_path', '') or ''
+            if not preview_audio or os.path.abspath(str(preview_audio)) != os.path.abspath(path):
+                return path
+        except Exception:
+            return path
+        try:
+            start, duration = preview_panel.selection_seconds()
+        except Exception:
+            return path
+        if duration <= 0.1:
+            return path
+        ffmpeg_path = self._ffmpeg_path()
+        if not ffmpeg_path:
+            raise RuntimeError("未找到 ffmpeg，无法裁剪参考音频选区。")
+        try:
+            stat = os.stat(path)
+            identity = (
+                f"{os.path.normcase(os.path.abspath(path))}|{stat.st_size}|"
+                f"{stat.st_mtime_ns}|{start:.3f}|{duration:.3f}"
+            )
+        except OSError as exc:
+            raise RuntimeError(f"无法读取参考音频：{exc}") from exc
+        cache_dir = workspace_path("缓存", "音频克隆参考片段")
+        os.makedirs(cache_dir, exist_ok=True)
+        digest = hashlib.sha1(identity.encode("utf-8", errors="ignore")).hexdigest()[:20]
+        output_path = os.path.join(cache_dir, f"{prefix}_{digest}.wav")
+        if os.path.exists(output_path) and os.path.getsize(output_path) >= 512:
+            return output_path
+        temp_path = output_path + f".{os.getpid()}.tmp.wav"
+        try:
+            extract_audio_from_media(
+                ffmpeg_path, path, temp_path,
+                start=start, duration=duration, sample_rate=16000
+            )
+            if not os.path.exists(temp_path) or os.path.getsize(temp_path) < 512:
+                raise RuntimeError("裁剪结果为空或损坏。")
+            os.replace(temp_path, output_path)
+        except Exception as exc:
+            try:
+                if os.path.exists(temp_path):
+                    os.remove(temp_path)
+            except OSError:
+                pass
+            raise RuntimeError(f"参考音频选区裁剪失败：{exc}") from exc
         return output_path
 
     def start_ultimate_transcribe(self):
-        audio_path = self.ultimate_ref_audio.text().strip()
+        """重新识别参考音频文字稿——带完整异常保护、状态重置与资源释放。"""
+        # 1. 输入校验
+        if not hasattr(self, 'ultimate_ref_audio'):
+            return
+        audio_path = (self.ultimate_ref_audio.text() or "").strip()
         if not audio_path or not os.path.exists(audio_path):
             QMessageBox.warning(self, "缺少参考音频", "请先选择可读取的参考音频。")
             return
+
+        # 2. 异步任务冲突防护：终止上一个识别 worker
         if self.transcribe_worker and self.transcribe_worker.isRunning():
-            QMessageBox.information(self, "识别中", "参考音频文字稿正在识别，请稍等。")
+            try:
+                self.transcribe_worker.cancel()
+                self.transcribe_worker.wait(5000)
+            except Exception:
+                pass
+            if self.transcribe_worker.isRunning():
+                self.ultimate_transcribe_status.setText("上一次识别任务正在停止，请稍后再试。")
+                return
+            self.transcribe_worker = None
+
+        # 3. 停止音频预览播放器，释放 ffplay 进程
+        try:
+            if hasattr(self, 'ultimate_preview') and self.ultimate_preview is not None:
+                self.ultimate_preview.stop()
+        except Exception:
+            pass
+
+        # 4. 安全裁剪选区，但不替换界面中的原始参考音频路径
+        use_selection = False
+        try:
+            if hasattr(self, 'ultimate_preview') and self.ultimate_preview is not None:
+                use_selection = self.ultimate_preview.has_custom_selection()
+                self._ultimate_transcribe_signature = self._current_ultimate_reference_signature()
+                audio_path = self._reference_audio_for_task(
+                    self.ultimate_ref_audio, self.ultimate_preview, "ultimate_ref_clip"
+                )
+        except Exception as exc:
+            traceback.print_exc()
+            message = str(exc or "参考音频选区裁剪失败")
+            self.ultimate_transcribe_status.setText(message)
+            QMessageBox.warning(self, "选区裁剪失败", message)
+            return
+
+        # 5. 二次校验音频路径
+        if not audio_path or not os.path.exists(audio_path):
+            QMessageBox.warning(self, "音频不可用", "参考音频文件不可用，请重新选择音频。")
             return
         try:
-            audio_path = self._reference_audio_for_task(self.ultimate_ref_audio, self.ultimate_preview, "ultimate_ref_clip")
-        except Exception as exc:
-            QMessageBox.warning(self, "裁剪失败", f"参考音频选区裁剪失败：{exc}")
+            if os.path.getsize(audio_path) < 256:
+                QMessageBox.warning(self, "音频无效", "参考音频文件过小或损坏，请更换音频文件。")
+                return
+        except OSError:
+            QMessageBox.warning(self, "音频不可读", "无法读取参考音频文件。")
             return
+
+        # 6. 重置 UI 状态
         self.ultimate_transcript.setPlainText("")
-        self.ultimate_transcript.setPlaceholderText("正在自动识别参考音频文字稿，请稍等...")
-        self.ultimate_transcribe_status.setText("正在自动识别参考音频文字稿...")
-        self.transcribe_worker = ReferenceTranscribeWorker(
-            audio_path,
-            self.config.get("output_dir", OUTPUT_DIR),
-            self.config.get("asr_model_path"),
-        )
-        self.transcribe_worker.progress.connect(self.ultimate_progress.setValue)
-        self.transcribe_worker.finished.connect(self.on_ultimate_transcribe_finished)
-        self.transcribe_worker.failed.connect(self.on_ultimate_transcribe_failed)
-        self.transcribe_worker.start()
+        context = "选区" if use_selection else "整段参考音频"
+        self._ultimate_transcribe_used_selection = use_selection
+        self.ultimate_transcript.setPlaceholderText(f"正在自动识别{context}文字稿，请稍等...")
+        self.ultimate_progress.setValue(0)
+        self.ultimate_transcribe_status.setText(f"正在自动识别{context}文字稿...")
+
+        # 7. 创建并启动识别 worker
+        try:
+            # 断开旧 worker 信号，防止重复触发
+            old = self.transcribe_worker
+            if old:
+                try:
+                    old.progress.disconnect()
+                    old.finished.disconnect()
+                    old.failed.disconnect()
+                except Exception:
+                    pass
+            worker = ReferenceTranscribeWorker(
+                audio_path,
+                self.config.get("output_dir", OUTPUT_DIR),
+                self.config.get("asr_model_path"),
+            )
+            worker.progress.connect(self.ultimate_progress.setValue)
+            worker.message.connect(self._log)
+            worker.finished.connect(self.on_ultimate_transcribe_finished)
+            worker.failed.connect(self.on_ultimate_transcribe_failed)
+            self.transcribe_worker = worker
+            worker.start()
+        except Exception:
+            traceback.print_exc()
+            self.ultimate_transcribe_status.setText("启动识别失败，请检查模型与依赖环境。")
+            QMessageBox.warning(self, "启动失败",
+                '无法启动文字稿识别。\n请先点击"检测运行环境"，确认 SenseVoiceSmall 模型可用。')
 
     def on_ultimate_transcribe_finished(self, text):
-        self.ultimate_progress.setValue(100)
-        self.ultimate_transcript.setPlainText(text)
-        self.ultimate_transcript.setPlaceholderText("选择参考音频后会自动识别文字稿，识别完成后可在这里校对微调。")
-        self.ultimate_transcribe_status.setText("文字稿已自动识别完成，可直接生成，也可以先校对微调。")
+        try:
+            if self._ultimate_transcribe_signature != self._current_ultimate_reference_signature():
+                self.ultimate_progress.setValue(0)
+                self.ultimate_transcribe_status.setText(
+                    "识别期间参考音频或选区发生变化，本次旧结果已忽略，请重新识别。"
+                )
+                return
+            self.ultimate_progress.setValue(100)
+            self.ultimate_transcript.setPlainText(str(text or ""))
+            self.ultimate_transcript.setPlaceholderText(
+                "选择参考音频后会自动识别文字稿，识别完成后可在这里校对微调。")
+            context = "选区" if self._ultimate_transcribe_used_selection else "整段音频"
+            self.ultimate_transcribe_status.setText(
+                f"{context}文字稿已识别完成，可直接生成，也可以先校对微调。")
+            self._log("参考音频文字稿识别完成。")
+        except Exception:
+            print("[音频克隆] on_ultimate_transcribe_finished 异常，但识别已完成", flush=True)
 
     def on_ultimate_transcribe_failed(self, message):
-        self.ultimate_progress.setValue(0)
-        self.ultimate_transcript.setPlaceholderText(message)
-        self.ultimate_transcribe_status.setText(message)
-        QMessageBox.warning(self, "自动识别失败", message)
+        try:
+            self.ultimate_progress.setValue(0)
+            msg = str(message or "识别失败")
+            self.ultimate_transcript.setPlaceholderText(msg)
+            self.ultimate_transcribe_status.setText(msg)
+            self._log(msg)
+            QMessageBox.warning(self, "自动识别失败", msg)
+        except Exception:
+            traceback.print_exc()
+            print(f"[音频克隆] 识别失败回调异常，原始消息：{message}", flush=True)
 
     def _choose_audio_to(self, line_edit):
-        path, _ = QFileDialog.getOpenFileName(self, "选择参考音频", os.getcwd(), "音频文件 (*.wav *.mp3 *.m4a *.flac *.aac);;所有文件 (*.*)")
+        path, _ = QFileDialog.getOpenFileName(self, "选择参考音频", workspace_path('素材', '音频素材'), "音频文件 (*.wav *.mp3 *.m4a *.flac *.aac);;所有文件 (*.*)")
         if path:
             line_edit.setText(path)
         return path
 
     def choose_batch_txt(self):
-        path, _ = QFileDialog.getOpenFileName(self, "导入 txt", os.getcwd(), "文本文件 (*.txt);;所有文件 (*.*)")
+        path, _ = QFileDialog.getOpenFileName(self, "导入 txt", workspace_path(), "文本文件 (*.txt);;所有文件 (*.*)")
         if path:
             self.batch_txt.setText(path)
             try:
@@ -1087,92 +1201,6 @@ class VoiceCloneWidget(QWidget):
         if path:
             self.batch_output_dir.setText(path)
             self._save_current_config()
-
-    def choose_prepare_input(self):
-        path, _ = QFileDialog.getOpenFileName(
-            self,
-            "选择音视频文件",
-            os.getcwd(),
-            "音视频文件 (*.mp4 *.mov *.mkv *.avi *.flv *.webm *.wav *.mp3 *.m4a *.flac *.aac);;所有文件 (*.*)",
-        )
-        if not path:
-            return
-        self.prepare_input.setText(path)
-        self.prepare_preview.set_audio(path)
-        ffprobe = os.path.join(tools_dir(), "ffprobe.exe")
-        duration = get_media_duration(ffprobe if os.path.exists(ffprobe) else "ffprobe", path)
-        if duration > 0:
-            self.prepare_status.setText(f"已读取文件，总时长约 {duration:.2f} 秒。建议截取 10-30 秒清晰人声。")
-            if self.prepare_duration.value() <= 0 or self.prepare_duration.value() > duration:
-                self.prepare_duration.setValue(min(30.0, duration))
-        else:
-            self.prepare_status.setText("已选择文件。未能读取总时长，但仍可直接提取或裁剪。")
-
-    def prepare_reference_audio(self):
-        if self.audio_prepare_worker and self.audio_prepare_worker.isRunning():
-            QMessageBox.information(self, "处理中", "参考音频正在处理，请稍等。")
-            return
-        input_path = self.prepare_input.text().strip()
-        if not input_path or not os.path.exists(input_path):
-            QMessageBox.warning(self, "缺少文件", "请先选择要提取/裁剪的音视频文件。")
-            return
-        self._save_current_config()
-        self.prepare_btn.setEnabled(False)
-        self.prepare_progress.setValue(0)
-        self.prepare_output.clear()
-        self.prepare_status.setText("正在处理参考音频...")
-        task = {
-            "input_path": input_path,
-            "output_dir": self.config.get("output_dir", OUTPUT_DIR),
-            "prefix": "prepared_reference",
-            "start": self.prepare_start.value(),
-            "duration": self.prepare_duration.value(),
-            "normalize_audio": self.prepare_normalize.isChecked(),
-        }
-        self.audio_prepare_worker = AudioPrepareWorker(task)
-        self.audio_prepare_worker.progress.connect(self.prepare_progress.setValue)
-        self.audio_prepare_worker.message.connect(self.prepare_status.setText)
-        self.audio_prepare_worker.finished.connect(self.on_prepare_finished)
-        self.audio_prepare_worker.failed.connect(self.on_prepare_failed)
-        self.audio_prepare_worker.start()
-
-    def on_prepare_finished(self, output_path):
-        self.prepare_btn.setEnabled(True)
-        self.prepare_output.setText(output_path)
-        self.prepare_status.setText("参考音频已处理完成，可设为普通克隆或高相似克隆的参考音频。")
-
-    def on_prepare_failed(self, message):
-        self.prepare_btn.setEnabled(True)
-        self.prepare_progress.setValue(0)
-        self.prepare_status.setText(message)
-        QMessageBox.warning(self, "参考音频处理失败", message)
-
-    def _prepared_audio_path(self):
-        path = self.prepare_output.text().strip()
-        if not path or not os.path.exists(path):
-            QMessageBox.information(self, "暂无处理结果", "请先完成参考音频提取/裁剪。")
-            return ""
-        return path
-
-    def set_prepared_audio_to_clone(self):
-        path = self._prepared_audio_path()
-        if not path:
-            return
-        self.clone_ref_audio.setText(path)
-        self.config["last_reference_audio"] = path
-        save_config(self.config)
-        self.tabs.setCurrentIndex(2)
-
-    def set_prepared_audio_to_ultimate(self):
-        path = self._prepared_audio_path()
-        if not path:
-            return
-        self.ultimate_ref_audio.setText(path)
-        self.config["last_reference_audio"] = path
-        save_config(self.config)
-        self.load_ultimate_reference_preview(path)
-        self.tabs.setCurrentIndex(3)
-        self.start_ultimate_transcribe()
 
     def start_batch_generate(self):
         if self.batch_worker and self.batch_worker.isRunning():
@@ -1218,6 +1246,7 @@ class VoiceCloneWidget(QWidget):
         self.batch_worker = BatchGenerateWorker(task)
         self.batch_worker.progress.connect(self.batch_progress.setValue)
         self.batch_worker.message.connect(lambda text: self.batch_list.addItem(text))
+        self.batch_worker.message.connect(self._log)
         self.batch_worker.finished.connect(self.on_batch_finished)
         self.batch_worker.failed.connect(self.on_batch_failed)
         self.batch_worker.start()
@@ -1226,12 +1255,14 @@ class VoiceCloneWidget(QWidget):
         self.batch_progress.setValue(100)
         self.batch_counts.setText(message.split("，输出目录：")[0])
         self.batch_list.addItem(message)
+        self._log(message)
         QMessageBox.information(self, "批量生成完成", message)
 
     def on_batch_failed(self, message):
         self.batch_progress.setValue(0)
         self.batch_counts.setText("批量生成失败")
         self.batch_list.addItem(message)
+        self._log(message)
         QMessageBox.warning(self, "批量生成失败", message)
 
     def generate_tts(self):
@@ -1295,6 +1326,13 @@ class VoiceCloneWidget(QWidget):
         if not prompt_text:
             QMessageBox.warning(self, "缺少参考音频文字稿", "请先自动识别或手动填写参考音频文字稿。")
             return
+        if self._ultimate_transcript_signature != self._current_ultimate_reference_signature():
+            QMessageBox.warning(
+                self,
+                "文字稿与选区不一致",
+                "参考音频或蓝色选区已变化，请重新识别文字稿，或者按当前选区重新手动校对文字稿。",
+            )
+            return
         if not text:
             QMessageBox.warning(self, "缺少生成文本", "请先输入要生成的新文本。")
             return
@@ -1337,6 +1375,7 @@ class VoiceCloneWidget(QWidget):
         button.setEnabled(False)
         self.generate_worker = VoiceGenerateWorker(task)
         self.generate_worker.progress.connect(progress_bar.setValue)
+        self.generate_worker.message.connect(self._log)
         self.generate_worker.finished.connect(lambda path: self._on_generate_finished(path, output_edit, button))
         self.generate_worker.failed.connect(lambda message: self._on_generate_failed(message, button))
         self.generate_worker.start()
@@ -1344,11 +1383,30 @@ class VoiceCloneWidget(QWidget):
     def _on_generate_finished(self, output_path, output_edit, button):
         button.setEnabled(True)
         output_edit.setText(output_path)
+        self._log(f"音频生成完成：{output_path}")
         QMessageBox.information(self, "生成完成", f"音频已生成：\n{output_path}")
 
     def _on_generate_failed(self, message, button):
         button.setEnabled(True)
+        self._log(message)
         QMessageBox.warning(self, "生成失败", message)
+
+    def prepare_app_close(self):
+        for preview_name in ("clone_preview", "ultimate_preview", "batch_preview"):
+            preview = getattr(self, preview_name, None)
+            if preview:
+                try:
+                    preview.stop()
+                except Exception:
+                    pass
+        for worker_name in ("generate_worker", "batch_worker", "transcribe_worker"):
+            worker = getattr(self, worker_name, None)
+            if worker and worker.isRunning():
+                try:
+                    worker.cancel()
+                    worker.wait(8000)
+                except Exception:
+                    pass
 
     def listen_audio(self, path):
         if not path or not os.path.exists(path):
