@@ -432,6 +432,143 @@ class DailyProductionTests(unittest.TestCase):
             self.app.processEvents()
             owner.close()
 
+    def old_daily_fixture(self, status="deleted"):
+        project = self.project(count=1)
+        self.repo.upsert_project(project)
+        plan = self.plan(["a"])
+        day = datetime.now().date().isoformat()
+        payloads, hooks = self.build(plan, [project], day=day)
+        task = self.repo.add_daily_batch(plan, day, payloads, hooks)[0]
+        if status == "deleted":
+            self.repo.remove_task(task.get("id"))
+        else:
+            self.repo.update_task(task.get("id"), status=status)
+        owner = AutomationOwner(self.repo, self.extensions, str(self.root / "cache"))
+        self.addCleanup(owner.close)
+        self.addCleanup(owner._close_daily_automation)
+        return owner, plan, project, task, day
+
+    def test_cleared_daily_queue_requests_confirmation_instead_of_silent_noop(self):
+        owner, plan, _, _, _ = self.old_daily_fixture()
+        before = self.repo.daily_state()
+        response = owner.request_daily_plan_run(plan.get("id"))
+        self.assertTrue(response.get("confirm_rebuild"))
+        self.assertIn("队列清除", response.get("message"))
+        self.assertEqual(self.repo.tasks(), [])
+        self.assertEqual(self.repo.daily_state(), before)
+
+    def test_confirmed_rebuild_uses_new_output_and_preserves_old_daily_record(self):
+        owner, plan, project, old, day = self.old_daily_fixture()
+        runs = self.repo.daily_state().get("runs", {})
+        with mock.patch.object(owner, "_start_daily_prepare") as start:
+            response = owner.request_daily_plan_run(plan.get("id"), confirm_rebuild=True)
+        self.assertFalse(response.get("confirm_rebuild"))
+        runtime_plan = start.call_args.args[0]
+        payloads, hooks = self.build(runtime_plan, [project], runs, day)
+        tasks = self.repo.add_daily_batch(runtime_plan, day, payloads, hooks)
+        self.assertEqual(len(tasks), 1)
+        self.assertNotEqual(tasks[0].get("output_dir"), old.get("output_dir"))
+        self.assertNotEqual(tasks[0].get("task_name"), old.get("task_name"))
+        state = self.repo.daily_state()
+        self.assertEqual(len(state.get("runs", {})), 2)
+        self.assertIn(runs[f"{plan.get('id')}:{day}"], state.get("runs", {}).values())
+        self.assertEqual(self.repo.add_daily_batch(runtime_plan, day, payloads, hooks), [])
+        self.assertFalse(plan_due(plan, state.get("runs", {}), datetime.now()))
+
+    def test_resume_stopped_daily_tasks_keeps_checkpoint_and_snapshot(self):
+        owner, plan, _, old, _ = self.old_daily_fixture("stopped")
+        self.repo.suspend_daily(True)
+        with mock.patch("services.batch_project_service.checkpoint_progress", return_value=(7, 800)):
+            response = owner.request_daily_plan_run(plan.get("id"))
+        resumed = self.repo.task(old.get("id"))
+        self.assertFalse(response.get("confirm_rebuild"))
+        self.assertEqual(resumed.get("completed"), 7)
+        self.assertEqual(resumed.get("status"), "waiting")
+        self.assertEqual(resumed.get("task_data"), old.get("task_data"))
+        self.assertEqual(owner.started, 1)
+        self.assertFalse(self.repo.daily_state().get("suspended"))
+
+    def test_completed_daily_plan_requires_confirmation_before_extra_batch(self):
+        owner, plan, _, old, _ = self.old_daily_fixture("completed")
+        result = owner.request_daily_plan_run(plan.get("id"))
+        self.assertTrue(result.get("confirm_rebuild"))
+        self.assertEqual(self.repo.task(old.get("id")).get("status"), "completed")
+        self.assertEqual(owner.started, 0)
+
+    def test_running_daily_plan_is_not_duplicated(self):
+        owner, plan, _, _, _ = self.old_daily_fixture("running")
+        response = owner.request_daily_plan_run(plan.get("id"), confirm_rebuild=True)
+        self.assertIn("正在执行", response.get("message"))
+        self.assertIsNone(owner._daily_worker)
+        self.assertEqual(len(self.repo.tasks()), 1)
+
+    def test_rebuild_commit_rejects_unfinished_task_restored_during_preparation(self):
+        owner, plan, project, old, day = self.old_daily_fixture("completed")
+        runs = self.repo.daily_state().get("runs", {})
+        with mock.patch.object(owner, "_start_daily_prepare") as start:
+            owner.request_daily_plan_run(plan.get("id"), confirm_rebuild=True)
+        runtime_plan = start.call_args.args[0]
+        payloads, hooks = self.build(runtime_plan, [project], runs, day)
+        self.repo.update_task(old.get("id"), status="waiting")
+        self.assertEqual(self.repo.add_daily_batch(runtime_plan, day, payloads, hooks), [])
+        self.assertEqual(self.repo.daily_state().get("runs", {}), runs)
+
+    def test_rebuild_save_failure_rolls_back_queue_and_history(self):
+        owner, plan, project, _, day = self.old_daily_fixture()
+        runs = self.repo.daily_state().get("runs", {})
+        with mock.patch.object(owner, "_start_daily_prepare") as start:
+            owner.request_daily_plan_run(plan.get("id"), confirm_rebuild=True)
+        runtime_plan = start.call_args.args[0]
+        payloads, hooks = self.build(runtime_plan, [project], runs, day)
+        with mock.patch.object(self.repo, "_save_state", side_effect=OSError("写入失败")):
+            with self.assertRaises(OSError):
+                self.repo.add_daily_batch(runtime_plan, day, payloads, hooks)
+        self.assertEqual(self.repo.tasks(), [])
+        self.assertEqual(self.repo.daily_state().get("runs", {}), runs)
+
+    def test_rebuild_background_result_reaches_queue_and_updates_plan_status(self):
+        owner, plan, _, _, _ = self.old_daily_fixture()
+        owner._daily_plan_dialog = mock.Mock()
+        def build(plan, projects, runs, day, extensions, cache_dir, cancelled):
+            return build_daily_payloads(plan, projects, runs, day, extensions, cache_dir,
+                                        cancelled=cancelled, probe=lambda path: 5)
+        with mock.patch("modules.batch_mixer.daily_automation_mixin.build_daily_payloads", side_effect=build):
+            owner.request_daily_plan_run(plan.get("id"), confirm_rebuild=True)
+            deadline = time.monotonic() + 10
+            while owner._daily_worker is not None and time.monotonic() < deadline:
+                self.app.processEvents()
+                time.sleep(0.01)
+            owner._thread_registry.shutdown(force=False)
+            self.app.processEvents()
+        self.assertIsNone(owner._daily_worker)
+        self.assertEqual(len(self.repo.tasks()), 1)
+        self.assertEqual(owner.started, 1)
+        self.assertIn("启动队列", owner._daily_plan_dialog.status.setText.call_args.args[0])
+
+    def test_dialog_cancel_rebuild_preserves_cleared_day_record(self):
+        owner, plan, _, _, _ = self.old_daily_fixture()
+        dialog = DailyPlanDialog(owner)
+        dialog._load(plan)
+        before = self.repo.daily_state().get("runs", {})
+        with mock.patch.object(QMessageBox, "question", return_value=QMessageBox.No):
+            dialog._run()
+        self.assertIn("已取消", dialog.status.text())
+        self.assertEqual(self.repo.daily_state().get("runs", {}), before)
+        self.assertIsNone(owner._daily_worker)
+        dialog.close()
+
+    def test_repeated_run_click_does_not_resave_plan_during_preparation(self):
+        owner, plan, _, _, _ = self.old_daily_fixture()
+        dialog = DailyPlanDialog(owner)
+        dialog._load(plan)
+        owner._daily_worker = mock.Mock()
+        before = self.repo.daily_state()
+        dialog._run()
+        self.assertEqual(self.repo.daily_state(), before)
+        self.assertIn("正在准备", dialog.status.text())
+        owner._daily_worker = None
+        dialog.close()
+
     def test_dialog_layout_and_shared_total(self):
         for i in range(4):
             self.repo.upsert_project(self.project(str(i)))

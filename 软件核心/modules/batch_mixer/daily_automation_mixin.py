@@ -1,6 +1,8 @@
 from datetime import datetime
+import copy
 import os
 import time
+import uuid
 
 from PyQt5.QtCore import QThread, QTimer, Qt, pyqtSignal
 
@@ -77,12 +79,82 @@ class DailyAutomationMixin:
         if not self._project_pending_scans and not self._editing_queue_task_id:
             self.save_current_batch_project(silent=True)
         dialog = DailyPlanDialog(self)
-        dialog.exec_()
+        self._daily_plan_dialog = dialog
+        try:
+            dialog.exec_()
+        finally:
+            self._daily_plan_dialog = None
 
     def _daily_log_once(self, message):
+        dialog = getattr(self, "_daily_plan_dialog", None)
+        if dialog is not None:
+            dialog.status.setText(message)
         if message != self._daily_notice:
             self._daily_notice = message
             self.update_log(f"[每日自动任务] {message}")
+
+    def request_daily_plan_run(self, plan_id, confirm_rebuild=False):
+        """手动执行区分续做和重建，不受当天自动去重记录永久阻挡。"""
+        def result(message, confirm=False):
+            self._daily_log_once(message)
+            return {"message": message, "confirm_rebuild": confirm}
+
+        if self._daily_closing:
+            return result("软件正在关闭，未启动任务。")
+        if self._daily_worker is not None:
+            return result("已有计划正在准备，请等待当前目录读取完成，不必重复点击。")
+        if self._editing_queue_task_id or getattr(self, "_fresh_asset_request", None):
+            return result("请先完成当前队列编辑或素材核对，再执行每日计划。")
+        state = self.batch_project_repo.daily_state()
+        plan = next((p for p in state.get("plans", []) if p.get("id") == plan_id), None)
+        if not plan or not plan.get("enabled"):
+            return result("计划不存在或未启用，请先保存计划。")
+        day = datetime.now().date().isoformat()
+        run = state.get("runs", {}).get(f"{plan_id}:{day}")
+        if run:
+            ids = set(run.get("task_ids", []))
+            tasks = [t for t in self.batch_project_repo.tasks(False) if t.get("id") in ids]
+            if any(t.get("status") == "running" for t in tasks):
+                return result("这个计划正在执行，无需重复启动；已完成进度和素材清单保持不变。")
+            unfinished = [t for t in tasks if t.get("status") in {"waiting", "stopped", "failed"}]
+            if unfinished:
+                self.batch_project_repo.suspend_daily(False)
+                for task in unfinished:
+                    if task.get("status") in {"stopped", "failed"}:
+                        self.batch_project_repo.retry_task(task.get("id"))
+                self._refresh_task_center()
+                engine = getattr(self, "engine_thread", None)
+                busy = engine is not None and engine.isRunning()
+                if not busy:
+                    self.start_batch_task_queue()
+                suffix = "当前任务结束后按队列顺序执行" if busy else "按队列顺序执行"
+                missing = len(ids - {t.get("id") for t in tasks})
+                message = f"已恢复 {len(unfinished)} 个未完成任务，保留原参数和断点，{suffix}。"
+                if missing:
+                    message += f"另有 {missing} 个已删除任务，不自动补建。"
+                return result(message)
+            if not confirm_rebuild:
+                reason = "今日任务已从队列清除" if not tasks else "今日现存任务已完成"
+                return result(f"{reason}。是否按当前保存的配置重新建立一批？已有成片保留，新批次另存目录，不覆盖旧视频。", True)
+            plan = copy.deepcopy(plan)
+            plan["_manual_batch_id"] = uuid.uuid4().hex
+            plan["_rerun_expected"] = copy.deepcopy(run)
+        self.batch_project_repo.suspend_daily(False)
+        self._start_daily_prepare(plan, state.get("runs", {}), day)
+        return {"message": self._daily_notice, "confirm_rebuild": False}
+
+    def _start_daily_prepare(self, plan, runs, day):
+        self._daily_log_once(f"正在读取“{plan.get('name')}”的最新素材，并计算轮数。")
+        worker = DailyPrepareWorker(
+            plan, self.batch_project_repo.projects(), runs, day,
+            dict(self.tab_exts), os.path.abspath(self.cache_dir),
+        )
+        self._daily_worker = worker
+        self._thread_registry.register(worker, "每日任务准备")
+        worker.prepared.connect(self._daily_prepared, Qt.QueuedConnection)
+        worker.failed.connect(self._daily_prepare_failed, Qt.QueuedConnection)
+        worker.finished.connect(self._daily_worker_finished, Qt.QueuedConnection)
+        worker.start()
 
     def _daily_tick(self, force_plan_id=""):
         if force_plan_id:
@@ -127,17 +199,7 @@ class DailyAutomationMixin:
                 continue
             if not forced and time.monotonic() < self._daily_retry_after.get(plan.get("id"), 0):
                 continue
-            self._daily_log_once(f"正在读取“{plan.get('name')}”的最新素材，并计算轮数。")
-            worker = DailyPrepareWorker(
-                plan, self.batch_project_repo.projects(), runs, now.date().isoformat(),
-                dict(self.tab_exts), os.path.abspath(self.cache_dir),
-            )
-            self._daily_worker = worker
-            self._thread_registry.register(worker, "每日任务准备")
-            worker.prepared.connect(self._daily_prepared, Qt.QueuedConnection)
-            worker.failed.connect(self._daily_prepare_failed, Qt.QueuedConnection)
-            worker.finished.connect(self._daily_worker_finished, Qt.QueuedConnection)
-            worker.start()
+            self._start_daily_prepare(plan, runs, now.date().isoformat())
             return
 
     def _daily_prepared(self, result):
@@ -170,13 +232,25 @@ class DailyAutomationMixin:
                 and all(t.get("daily_plan_id") for t in waiting)
                 and not (engine is not None and engine.isRunning())):
             self.start_batch_task_queue()
+            self._daily_log_once(f"已加入 {len(tasks)} 个任务并启动队列，进度可在任务队列查看。")
+        else:
+            if self._editing_queue_task_id:
+                reason = "请先保存或取消队列编辑，再启动队列"
+            elif any(not task.get("daily_plan_id") for task in waiting):
+                reason = "队列中有手动等待任务，请在任务队列启动"
+            else:
+                reason = "当前任务结束后按队列顺序执行"
+            self._daily_log_once(f"已加入 {len(tasks)} 个等待任务；{reason}。")
 
     def _daily_prepare_failed(self, message):
         worker = self._daily_worker
         if worker:
             self._daily_retry_after[worker.plan.get("id")] = time.monotonic() + 300
             self._daily_forced_plan_ids.discard(worker.plan.get("id"))
-        self._daily_log_once(f"准备未完成，5分钟后重试：{message}")
+        if worker and worker.plan.get("_manual_batch_id"):
+            self._daily_log_once(f"重新建立失败：{message}。原记录和成片已保留，修复后可再次点击立即执行。")
+        else:
+            self._daily_log_once(f"准备未完成，5分钟后重试：{message}")
 
     def _daily_worker_finished(self):
         worker = self._daily_worker

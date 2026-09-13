@@ -249,6 +249,9 @@ def build_daily_payloads(plan, projects, runs, day, extensions, cache_dir,
         name = safe_output_component(project.get("product_name"), "模板")
         # 模板 ID 与计划 ID 避免同店同名模板或多个计划写入同一路径。
         output = os.path.join(output_base, shop, day, f"{name}_{pid[:6]}_{plan.get('id', '')[:6]}")
+        batch_id = str(plan.get("_manual_batch_id") or "")
+        if batch_id:
+            output += f"_重建_{safe_output_component(batch_id)[:12]}"
         subtitle = copy.deepcopy(project.get("subtitle", {}))
         for field in ("color", "border_color"):
             color = str(subtitle.get(field) or ("white" if field == "color" else "black"))
@@ -275,6 +278,8 @@ def build_daily_payloads(plan, projects, runs, day, extensions, cache_dir,
             for tab, field in ASSET_FIELDS.items()
         }
         task_name = f"{shop} {day} {name} {pid[:6]} {plan.get('id', '')[:6]}"
+        if batch_id:
+            task_name += f" 重建{batch_id[:12]}"
         payloads.append({
             "project_id": pid, "project_snapshot": project, "directories": directories,
             "shop_name": project.get("shop_name", ""), "product_name": project.get("product_name", ""),

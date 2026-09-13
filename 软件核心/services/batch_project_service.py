@@ -332,16 +332,30 @@ class BatchProjectRepository:
             daily = self._state.setdefault("daily", {})
             current = next((p for p in daily.get("plans", []) if p.get("id") == plan.get("id")), {})
             if (daily.get("suspended") or not current.get("enabled")
-                    or current.get("revision") != plan.get("revision")
-                    or key in daily.get("runs", {})):
+                    or current.get("revision") != plan.get("revision")):
+                return []
+            previous = daily.get("runs", {}).get(key)
+            batch_id = plan.get("_manual_batch_id", "")
+            if previous:
+                if not batch_id or previous != plan.get("_rerun_expected"):
+                    return []
+                previous_ids = set(previous.get("task_ids", []))
+                if any(task.get("id") in previous_ids and task.get("status") != COMPLETED_STATUS
+                       for task in self._state.get("tasks", [])):
+                    return []
+            elif batch_id:
                 return []
             old_state = copy.deepcopy(self._state)
             tasks = [self._prepare_task(p) for p in payloads]
             try:
                 self._state.setdefault("tasks", []).extend(tasks)
+                if previous:
+                    # 保留旧批次的钩子记录；新记录与新队列必须一起成功，不能提前清除去重标记。
+                    daily.setdefault("runs", {})[f"{key}:previous:{batch_id}"] = copy.deepcopy(previous)
                 daily.setdefault("runs", {})[key] = {
                     "day": day, "task_ids": [t.get("id") for t in tasks],
                     "hooks": hooks, "expected": sum(t.get("expected", 0) for t in tasks),
+                    "batch_id": batch_id,
                 }
                 self._trim_completed_history()
                 self._save_state(self._state)

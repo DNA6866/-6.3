@@ -274,11 +274,24 @@ class DailyPlanDialog(QDialog):
             self._reset_form()
 
     def _run(self):
+        if getattr(self.owner, "_daily_worker", None) is not None:
+            self.status.setText("已有计划正在准备，请等待目录读取完成，不必重复点击。")
+            return
         self.enabled.setChecked(True)
         if self._save():
-            self.repo.suspend_daily(False)
-            self.owner._daily_tick(force_plan_id=self.plan.get("id"))
-            self.status.setText("已请求执行今日计划；任务进度及等待原因见主窗口日志")
+            try:
+                result = self.owner.request_daily_plan_run(self.plan.get("id"))
+                if result.get("confirm_rebuild"):
+                    answer = QMessageBox.question(self, "重新建立今日任务", result.get("message", ""),
+                                                  QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+                    if answer != QMessageBox.Yes:
+                        self.status.setText("已取消重新建立，原有记录和成片保持不变。")
+                        return
+                    result = self.owner.request_daily_plan_run(self.plan.get("id"), confirm_rebuild=True)
+                self.status.setText(result.get("message", ""))
+            except Exception as exc:
+                self.status.setText(f"执行失败：{exc}")
+                self.owner.update_log(f"[每日自动任务] 手动执行失败：{exc}")
 
     def _toggle(self):
         paused = not self.repo.daily_state().get("suspended", False)
