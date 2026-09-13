@@ -143,7 +143,7 @@ class WorkbenchMixin:
         r_layout.setLabelAlignment(Qt.AlignLeft | Qt.AlignVCenter)
         self.mixer_mode_combo = QComboBox()
         self.mixer_mode_combo.addItem("传统音频混剪（音频素材 + 视频素材）", "traditional")
-        self.mixer_mode_combo.addItem("普通视频拼接（视频素材 + 可选BGM）", "ordinary")
+        # 说明：原「普通视频拼接(ordinary)」与「传统音频混剪(traditional)」引擎行为完全一致，已合并为传统模式（旧存档自动兼容）。
         self.mixer_mode_combo.addItem("数字人口播第一轨道（第一轨道原声 + 视频覆盖）", "first_track")
         self.mixer_mode_combo.addItem("AI完整开场（AI视频 + 第一轨道 + 原有混剪）", "ai_intro_first_track")
         self.mixer_mode_combo.addItem("AI开场+音频拼接（AI视频 + 钩子 + 产品随机）", "ai_intro_audio")
@@ -274,8 +274,8 @@ class WorkbenchMixin:
         self.smart_sfx_chk = QCheckBox("启用")
         self.smart_sfx_chk.setChecked(False)
         self.smart_sfx_chk.setToolTip(
-            "按片头、钩子、产品切换、转场和收尾自动加入轻量音效；"
-            "默认关闭，不改变旧任务声音。"
+            "按片头、钩子、产品切换、转场和收尾匹配真实短音效；"
+            "会自动避开连续重复并为人声留出空间。"
         )
         self.smart_sfx_strength_combo = QComboBox()
         self.smart_sfx_strength_combo.addItem("轻量（少而克制）", "light")
@@ -284,7 +284,8 @@ class WorkbenchMixin:
         self.smart_sfx_strength_combo.setCurrentIndex(1)
         self.smart_sfx_strength_combo.setEnabled(False)
         self.smart_sfx_strength_combo.setToolTip(
-            "内置 16 类共 192 个音色，连续音效不会重复；强度影响密度和音量。"
+            "优先使用本机剪映已经下载的音效；强度影响密度和响度。"
+            "也会读取“用户工作区\\素材\\智能音效”内的自定义音效。"
         )
         self.smart_sfx_strength_combo.wheelEvent = lambda event: event.ignore()
         self.smart_sfx_chk.toggled.connect(
@@ -331,6 +332,22 @@ class WorkbenchMixin:
         v_layout.addRow("LUT滤镜:", self.lut_combo)
 
         self.anti_dedup_chk = QCheckBox("启用【微变速/调色】防重"); self.anti_dedup_chk.setChecked(True); v_layout.addRow("平台过审:", self.anti_dedup_chk)
+        # 参数防重抖动：让开头时长/强结构节点/转场时长/音量在 ±% 内每条成片随机浮动
+        jitter_layout = QHBoxLayout()
+        self.param_jitter_spin = QSpinBox()
+        self.param_jitter_spin.setRange(0, 40)
+        self.param_jitter_spin.setValue(15)
+        self.param_jitter_spin.setSuffix(" %")
+        self.param_jitter_spin.setSingleStep(5)
+        self.param_jitter_spin.setToolTip(
+            "把「开头覆盖 / 数字人露出 / 产品穿插 / 露出次数 / 转场时长 / 音量」这些固定参数，\n"
+            "在 ±范围内每条成片随机浮动，避免同一批视频的时间轴骨架完全一致被平台判重复。\n"
+            "0% = 关闭（所有视频共用你设定的固定值）。"
+        )
+        self.param_jitter_spin.wheelEvent = lambda event: event.ignore()
+        jitter_layout.addWidget(self.param_jitter_spin)
+        jitter_layout.addStretch(1)
+        v_layout.addRow("参数防重抖动:", jitter_layout)
         output_layout = QHBoxLayout(); self.res_combo = QComboBox(); self.res_combo.addItems(["720x1280 (竖屏)"]); self.res_combo.currentTextChanged.connect(self.draw_preview_canvas); self.res_combo.currentTextChanged.connect(self.draw_subtitle_preview)
         output_layout.addWidget(self.res_combo); v_layout.addRow("画面比例:", output_layout); vis_group.setLayout(v_layout); form_layout.addRow(vis_group)
         
@@ -499,4 +516,3 @@ class WorkbenchMixin:
         layout.addWidget(workspace, stretch=1)
         layout.addWidget(settings_scroll, stretch=0)
         return page
-

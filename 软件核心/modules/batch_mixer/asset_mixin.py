@@ -5,15 +5,20 @@ from PyQt5.QtGui import QColor
 from PyQt5.QtWidgets import QFileDialog, QTableWidgetItem
 
 from services.media_service import import_files_to_folder
+from services.media_index_service import get_media_index
 from services.platform_service import open_path
 from paths import workspace_path
 from ui_components import DirectoryScanWorker, resolve_network_path
+from modules.batch_mixer.asset_refresh_mixin import AssetRefreshMixin
 
 
-class AssetMixin:
+class AssetMixin(AssetRefreshMixin):
     def init_directories(self):
-        for folder in self.tab_folders.values(): os.makedirs(folder, exist_ok=True)
-        os.makedirs(self.cache_dir, exist_ok=True); os.makedirs(self.av_output_dir, exist_ok=True); os.makedirs(self.bin_dir, exist_ok=True)
+        for folder in self.tab_folders.values():
+            os.makedirs(folder, exist_ok=True)
+        os.makedirs(self.cache_dir, exist_ok=True)
+        os.makedirs(self.av_output_dir, exist_ok=True)
+        os.makedirs(self.bin_dir, exist_ok=True)
         os.makedirs(self.font_dir, exist_ok=True)
         # 不在软件启动时自动清理共享缓存。批量混剪运行中会持续读写 temp_*.ts，
         # 若第二个窗口或测试实例启动时清缓存，会导致正在运行的 ffmpeg 节点找不到临时片段。
@@ -57,7 +62,8 @@ class AssetMixin:
     def open_directory_explorer(self, tab_name):
         try:
             folder_path = self.tab_folders.get(tab_name, "")
-            if os.path.exists(folder_path): open_path(folder_path)
+            if os.path.exists(folder_path):
+                open_path(folder_path)
         except Exception:
             print(f"[警告] 打开目录失败: {tab_name}", flush=True)
 
@@ -105,6 +111,9 @@ class AssetMixin:
         folder_path = self.tab_folders.get(tab_name, "")
         if not folder_path or tab_name not in self.tables:
             return
+        request = getattr(self, "_fresh_asset_request", None)
+        if request and tab_name in request.get("ids", {}):
+            self.cancel_pending_asset_refresh()
         folder_path = os.path.abspath(folder_path)
         self._directory_scan_seq += 1
         request_id = self._directory_scan_seq
@@ -121,8 +130,12 @@ class AssetMixin:
             folder_path,
             self.tab_exts.get(tab_name, []),
             request_id,
+            force_refresh=True,
         )
         self._directory_scan_workers[request_id] = worker
+        registry = getattr(self, "_thread_registry", None)
+        if registry is not None:
+            registry.register(worker, f"目录扫描:{tab_name}")
         worker.scan_finished.connect(self._on_directory_scan_finished, Qt.QueuedConnection)
         worker.scan_failed.connect(self._on_directory_scan_failed, Qt.QueuedConnection)
         worker.finished.connect(
@@ -130,6 +143,7 @@ class AssetMixin:
             Qt.QueuedConnection,
         )
         worker.start()
+        return request_id
 
     def _on_directory_scan_finished(self, tab_name, folder_path, request_id, files):
         if self._directory_scan_latest.get(tab_name) != request_id:
@@ -141,6 +155,8 @@ class AssetMixin:
         self._populate_directory_table(tab_name, files)
         if hasattr(self, 'on_project_directory_populated'):
             self.on_project_directory_populated(tab_name)
+        self.sync_template_asset_selection(tab_name)
+        self._finish_fresh_asset_scan(tab_name, request_id)
         if tab_name == '第一轨道' or scanned_folder.startswith("\\\\"):
             child_count = sum(
                 1
@@ -161,6 +177,7 @@ class AssetMixin:
         self.update_log(f"[目录读取] 【{tab_name}】后台扫描失败：{message}")
         if hasattr(self, 'on_project_directory_scan_failed'):
             self.on_project_directory_scan_failed(tab_name)
+        self._finish_fresh_asset_scan(tab_name, request_id, message)
 
     def _on_directory_scan_thread_finished(self, request_id):
         worker = self._directory_scan_workers.pop(request_id, None)
@@ -171,6 +188,11 @@ class AssetMixin:
         table = self.tables.get(tab_name)
         if table is None:
             return
+        selected = {table.item(row, 2).text() for row in range(table.rowCount())
+                    if table.item(row, 2) and self._asset_row_checked(table, row)}
+        statuses = {table.item(row, 2).text(): table.item(row, 3).text()
+                    for row in range(table.rowCount())
+                    if tab_name == '音频素材' and table.item(row, 2) and table.item(row, 3)}
         table.blockSignals(True)
         table.setUpdatesEnabled(False)
         try:
@@ -181,16 +203,19 @@ class AssetMixin:
                 chk_item = QTableWidgetItem()
                 chk_item.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable)
                 chk_item.setTextAlignment(Qt.AlignCenter)
-                self._set_asset_check_item_visual(chk_item, current_select_all)
+                self._set_asset_check_item_visual(chk_item, current_select_all or full_path in selected)
                 table.setItem(row, 0, chk_item)
                 table.setItem(row, 1, QTableWidgetItem(display_name))
                 table.setItem(row, 2, QTableWidgetItem(full_path))
                 if tab_name == '音频素材':
-                    status_item = QTableWidgetItem("待处理"); status_item.setTextAlignment(Qt.AlignCenter)
+                    status_item = QTableWidgetItem(statuses.get(full_path, "待处理"))
+                    status_item.setTextAlignment(Qt.AlignCenter)
                     table.setItem(row, 3, status_item)
         finally:
             table.setUpdatesEnabled(True)
             table.blockSignals(False)
+        if tab_name == '音频素材':
+            self._audio_table_rows = {os.path.normcase(path): row for row, (_, path) in enumerate(files)}
         table.viewport().update()
         self.update_asset_count_label(tab_name)
         if tab_name == '视频素材' and hasattr(self, 'preview_canvas') and not self.preview_bg_manual:
@@ -200,12 +225,14 @@ class AssetMixin:
 
     def refresh_directory(self, tab_name, silent=False):
         folder_path = self.tab_folders.get(tab_name, "")
-        if not os.path.exists(folder_path):
-            os.makedirs(folder_path, exist_ok=True)
         allowed_exts = self.tab_exts.get(tab_name, [])
         try:
+            if not os.path.isdir(folder_path):
+                raise OSError(f"素材目录不可访问：{folder_path}")
             files = []
-            for root, _, names in os.walk(folder_path):
+            def on_error(exc):
+                raise exc
+            for root, _, names in os.walk(folder_path, onerror=on_error):
                 for filename in names:
                     full_path = os.path.abspath(os.path.join(root, filename))
                     if not os.path.isfile(full_path):
@@ -215,9 +242,14 @@ class AssetMixin:
                     rel_name = os.path.relpath(full_path, folder_path)
                     files.append((rel_name, full_path))
             files.sort(key=lambda item: item[0].lower())
+            get_media_index().store_directory(folder_path, allowed_exts, files)
             self._populate_directory_table(tab_name, files)
-        except Exception:
-            pass
+            # 同步刷新同样要恢复项目素材勾选（否则启动恢复/切换时勾选不联动）
+            if hasattr(self, "on_project_directory_populated"):
+                self.on_project_directory_populated(tab_name)
+            self.sync_template_asset_selection(tab_name)
+        except OSError as exc:
+            self.update_log(f"[目录读取] {tab_name}：{exc}")
 
     def update_asset_count_label(self, tab_name):
         label = self.asset_count_labels.get(tab_name)
@@ -281,22 +313,41 @@ class AssetMixin:
         table = self.tables.get(tab_name)
         if not table:
             return
-        self._set_asset_row_checked(table, item.row(), not self._asset_row_checked(table, item.row()))
+        checked = not self._asset_row_checked(table, item.row())
+        self._set_asset_row_checked(table, item.row(), checked)
+        checkbox = self.select_all_cbx.get(tab_name)
+        if not checked and checkbox and checkbox.isChecked():
+            # 单独取消一项即进入手动选择；不能触发“取消全选”把其他行也清掉。
+            blocked = checkbox.blockSignals(True)
+            checkbox.setChecked(False)
+            checkbox.blockSignals(blocked)
         self.update_asset_count_label(tab_name)
 
     def update_table_status(self, row_index, text, color_name):
         table = self.tables.get('音频素材')
-        if not table: return
+        if not table:
+            return
+        paths = getattr(self, '_active_audio_status_paths', None)
+        if paths is not None:
+            # 运行期间手动刷新或准备新队列可能改变行号，进度必须跟随原文件。
+            source = paths.get(row_index, '')
+            row_index = getattr(self, '_audio_table_rows', {}).get(os.path.normcase(source), -1)
         if row_index < 0 or row_index >= table.rowCount():
             return
         if row_index < table.rowCount():
             item = QTableWidgetItem(text)
-            if color_name == "blue": item.setForeground(Qt.blue)
-            elif color_name == "green": item.setForeground(Qt.darkGreen)
-            elif color_name == "red": item.setForeground(Qt.red)
-            elif color_name: item.setForeground(QColor(color_name))
+            if color_name == "blue":
+                item.setForeground(Qt.blue)
+            elif color_name == "green":
+                item.setForeground(Qt.darkGreen)
+            elif color_name == "red":
+                item.setForeground(Qt.red)
+            elif color_name:
+                item.setForeground(QColor(color_name))
             item.setTextAlignment(Qt.AlignCenter)
-            font = item.font(); font.setBold(True); item.setFont(font)
+            font = item.font()
+            font.setBold(True)
+            item.setFont(font)
             table.setItem(row_index, 3, item)
 
     def auto_refresh_all(self):
@@ -304,7 +355,8 @@ class AssetMixin:
             self.refresh_directory_async(t, silent=True)
         
     def toggle_select_all(self, tab_name, state):
-        table = self.tables[tab_name]; is_checked = (state == Qt.Checked)
+        table = self.tables[tab_name]
+        is_checked = state == Qt.Checked
         self._asset_count_update_blocked.add(tab_name)
         table.blockSignals(True)
         table.setUpdatesEnabled(False)

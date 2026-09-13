@@ -77,9 +77,10 @@ def expected_resume_job_keys(task_data):
 class RenderCheckpointStore:
     """线程安全地记录已经成功落盘的混剪子任务。"""
 
-    def __init__(self, path, task_id=""):
+    def __init__(self, path, task_id="", output_validator=None):
         self.path = os.path.abspath(str(path or "")) if path else ""
         self.task_id = str(task_id or "")
+        self.output_validator = output_validator
         self._lock = threading.RLock()
         self._state = self._load()
 
@@ -109,10 +110,37 @@ class RenderCheckpointStore:
         return state
 
     @staticmethod
-    def _output_valid(output_path):
+    def _output_identity(output_path):
         try:
-            return os.path.isfile(output_path) and os.path.getsize(output_path) > 1024
+            stat = os.stat(output_path)
+            return {
+                "size": int(stat.st_size),
+                "mtime_ns": int(
+                    getattr(
+                        stat,
+                        "st_mtime_ns",
+                        int(stat.st_mtime * 1_000_000_000),
+                    )
+                ),
+            }
         except OSError:
+            return {}
+
+    def _output_valid(self, output_path, record=None):
+        identity = self._output_identity(output_path)
+        if int(identity.get("size") or 0) <= 1024:
+            return False
+        saved = record if isinstance(record, dict) else {}
+        if (
+            int(saved.get("size") or 0) == identity["size"]
+            and int(saved.get("mtime_ns") or 0) == identity["mtime_ns"]
+        ):
+            return True
+        if self.output_validator is None:
+            return True
+        try:
+            return bool(self.output_validator(output_path))
+        except Exception:
             return False
 
     def _save_locked(self):
@@ -138,17 +166,25 @@ class RenderCheckpointStore:
             expected = set(expected_keys) if expected_keys is not None else None
             valid = set()
             stale = []
+            refreshed = False
             for key, record in jobs.items():
                 if expected is not None and key not in expected:
                     continue
                 output_path = str(
                     record.get("output_path") if isinstance(record, dict) else ""
                 )
-                if self._output_valid(output_path):
+                if self._output_valid(output_path, record):
                     valid.add(key)
+                    identity = self._output_identity(output_path)
+                    if isinstance(record, dict) and any(
+                        record.get(name) != value
+                        for name, value in identity.items()
+                    ):
+                        record.update(identity)
+                        refreshed = True
                 else:
                     stale.append(key)
-            if stale:
+            if stale or refreshed:
                 for key in stale:
                     jobs.pop(key, None)
                 try:
@@ -161,11 +197,13 @@ class RenderCheckpointStore:
         if not self.path or not job_key or not self._output_valid(output_path):
             return False
         with self._lock:
+            identity = self._output_identity(output_path)
             self._state.setdefault("completed_jobs", {})[str(job_key)] = {
                 "output_path": os.path.abspath(str(output_path)),
                 "source_path": str(source_path or ""),
                 "round_idx": max(1, int(round_idx or 1)),
                 "completed_at": datetime.now().isoformat(timespec="seconds"),
+                **identity,
             }
             self._save_locked()
         return True

@@ -60,6 +60,7 @@ class ConfigMixin:
                 'loop_count': self.loop_spin.value(), 'threads': self.thread_spin.value(),
                 'anti_dedup': self.anti_dedup_chk.isChecked(),
                 'auto_perf': self.auto_perf_chk.isChecked(),
+                'param_jitter': round(self.param_jitter_spin.value() / 100.0, 3),
                 'output_date_folder': True
             },
             'subtitle': {
@@ -154,6 +155,7 @@ class ConfigMixin:
             if 'loop_count' in rules: self.loop_spin.setValue(_config_value(rules, 'loop_count', self.loop_spin.value()))
             if 'threads' in rules: self.thread_spin.setValue(_config_value(rules, 'threads', self.thread_spin.value()))
             if 'anti_dedup' in rules: self.anti_dedup_chk.setChecked(bool(_config_value(rules, 'anti_dedup', self.anti_dedup_chk.isChecked())))
+            if 'param_jitter' in rules: self.param_jitter_spin.setValue(int(round(float(_config_value(rules, 'param_jitter', 0.15) or 0.0) * 100)))
             if 'auto_perf' in rules: self.auto_perf_chk.setChecked(bool(_config_value(rules, 'auto_perf', self.auto_perf_chk.isChecked())))
 
             sub = config.get('subtitle', {})

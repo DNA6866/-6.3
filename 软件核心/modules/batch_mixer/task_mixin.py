@@ -555,11 +555,13 @@ class TaskMixin:
             'resolution': self.res_combo.currentText(),
             'gpu_mode': self.gpu_combo.currentText(),
             'threads': 1 if preview_only else self.thread_spin.value(),
+            'auto_performance': self.auto_perf_chk.isChecked(),
             'loop_count': 1 if preview_only else self.loop_spin.value(),
             'cache_dir': os.path.abspath(self.cache_dir),
             'output_dir': self._mixer_output_dir(),
             'enable_standard_video_cache': True,
             'anti_dedup': self.anti_dedup_chk.isChecked(),
+            'param_jitter': round(self.param_jitter_spin.value() / 100.0, 3),
             'preview_only': preview_only,
             'sys_fonts': copy.deepcopy(self.sys_fonts),
             'sub_config': {
@@ -616,6 +618,9 @@ class TaskMixin:
             self.preview_sample_btn.setEnabled(False)
         engine = SynthesisEngine(task_data)
         self.engine_thread = engine
+        registry = getattr(self, "_thread_registry", None)
+        if registry is not None:
+            registry.register(engine, "批量混剪引擎", engine.stop)
         engine.log_signal.connect(self.update_log, Qt.QueuedConnection)
         engine.task_done_signal.connect(self.on_task_done, Qt.QueuedConnection)
         if queue_task_id and hasattr(self, 'update_active_queue_status'):
@@ -624,6 +629,10 @@ class TaskMixin:
                 Qt.QueuedConnection,
             )
         else:
+            self._active_audio_status_paths = {
+                item.get('row'): item.get('path', '') for item in task_data.get('audios', [])
+                if item.get('row', -1) >= 0
+            }
             engine.status_update_signal.connect(
                 self.update_table_status,
                 Qt.QueuedConnection,
@@ -641,11 +650,14 @@ class TaskMixin:
         self.update_log("[任务控制] 后台合成线程已启动。")
         self._write_mixer_start_trace("后台合成线程 start() 已调用")
 
-    def start_synthesis(self, preview_only=False):
+    def start_synthesis(self, preview_only=False, assets_refreshed=False):
         try:
             engine = getattr(self, 'engine_thread', None)
             if engine is not None and engine.isRunning():
                 self.update_log("[任务控制] 已有混剪任务正在运行，本次点击已忽略。")
+                return
+            if not assets_refreshed:
+                self.request_task_asset_refresh(lambda: self.start_synthesis(preview_only, assets_refreshed=True))
                 return
             start_label = "预览样片" if preview_only else "正式混剪任务"
             self._write_mixer_start_trace(

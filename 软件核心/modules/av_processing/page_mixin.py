@@ -2,7 +2,7 @@ import os
 import subprocess
 import time
 
-from PyQt5.QtCore import Qt, QTimer, QUrl
+from PyQt5.QtCore import Qt, QThread, QTimer, QUrl, pyqtSignal
 from PyQt5.QtGui import QPixmap
 from PyQt5.QtMultimedia import QMediaContent, QMediaPlayer
 from PyQt5.QtWidgets import (
@@ -23,8 +23,6 @@ from PyQt5.QtWidgets import (
     QMessageBox,
     QPlainTextEdit,
     QPushButton,
-    QScrollArea,
-    QSizePolicy,
     QSpinBox,
     QStackedWidget,
     QStyle,
@@ -139,6 +137,11 @@ class AVProcessingMixin:
         self.update_log(f'[目录串联] 自动填入{chain_name}的输出文件到当前输入框，总共 {len(existing)} 个文件。')
 
     def on_av_task_finished(self, ok, message):
+        kind = getattr(self, 'current_av_kind', '')
+        worker = getattr(self, 'av_worker', None)
+        outputs = getattr(worker, 'output_paths', None)
+        if outputs is not None and kind:
+            self.av_last_outputs[kind] = [path for path in outputs if os.path.isfile(path)]
         if ok:
             self.task_progress.setValue(100)
             self.update_log(f"[音视频处理] 完成: {message}")
@@ -232,7 +235,17 @@ class AVProcessingMixin:
         os.makedirs(self.av_output_dir, exist_ok=True)
         base = os.path.splitext(os.path.basename(input_path))[0]
         stamp = time.strftime("%Y%m%d_%H%M%S")
-        return os.path.abspath(os.path.join(self.av_output_dir, f"{base}_{suffix}_{stamp}.{ext}"))
+        stem = f"{base}_{suffix}_{stamp}"
+        reserved = getattr(self, '_av_reserved_outputs', None)
+        if reserved is None:
+            self._av_reserved_outputs = reserved = set()
+        path = os.path.abspath(os.path.join(self.av_output_dir, f"{stem}.{ext}"))
+        number = 1
+        while os.path.exists(path) or os.path.normcase(path) in reserved:
+            number += 1
+            path = os.path.abspath(os.path.join(self.av_output_dir, f"{stem}_{number}.{ext}"))
+        reserved.add(os.path.normcase(path))
+        return path
 
     def get_media_duration(self, input_path):
         ffprobe = os.path.abspath(os.path.join(tools_dir(), 'ffprobe.exe'))
@@ -245,7 +258,8 @@ class AVProcessingMixin:
                 text=True,
                 encoding='utf-8',
                 errors='ignore',
-                startupinfo=self.get_si()
+                startupinfo=self.get_si(), timeout=8,
+                creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0),
             )
             return max(0.0, float(res.stdout.strip()))
         except Exception:
@@ -268,6 +282,7 @@ class AVProcessingMixin:
             return
 
         jobs = []
+        self._av_reserved_outputs = set()
         for input_path in inputs:
             job = task.copy()
             covers = job.pop('cover_paths', [])
@@ -287,10 +302,11 @@ class AVProcessingMixin:
             jobs.append(job)
         self.task_progress.setValue(0)
         self.current_av_kind = task.get('kind', '')
+        self.av_last_outputs.pop(self.current_av_kind, None)
         if task.get('kind') == 'add_subtitle':
-            # 视频加字幕：使用独立 worker（含 ASR + ASS 烧录）
+            # 视频加字幕：使用独立 worker（含 ASR + ASS 烧录），支持多视频逐个处理
             from .workers import AddSubtitleWorker
-            self.av_worker = AddSubtitleWorker(jobs[0])
+            self.av_worker = AddSubtitleWorker({'jobs': jobs, 'startupinfo': self.get_si()})
         else:
             self.av_worker = AVProcessWorker({'jobs': jobs, 'startupinfo': self.get_si()})
         self.av_worker.log_signal.connect(lambda text: self.update_log(f"[音视频处理] {text}"))
@@ -612,7 +628,8 @@ class AVProcessingMixin:
         QMessageBox.warning(self, "下载失败", message)
 
     def build_av_extract_audio_page(self):
-        fmt = QComboBox(); fmt.addItems(["mp3", "wav"])
+        fmt = QComboBox()
+        fmt.addItems(["mp3", "wav"])
         return self.build_av_tool_page(
             "视频分离音频",
             "从视频文件中提取音频，输出到固定目录。",
@@ -630,7 +647,8 @@ class AVProcessingMixin:
         )
 
     def build_av_convert_page(self):
-        fmt = QComboBox(); fmt.addItems(["mp4", "mov", "avi", "mp3", "wav", "m4a"])
+        fmt = QComboBox()
+        fmt.addItems(["mp4", "mov", "avi", "mp3", "wav", "m4a"])
         standard_sdr_chk = QCheckBox("iPhone HDR/MOV 转标准 MP4（防发白）")
         standard_sdr_chk.setToolTip("检测到 HDR/BT.2020 时自动转 SDR；普通素材输出为标准 BT.709 MP4。原文件不覆盖。")
         standard_sdr_hint = QLabel("用于 iPhone HDR、杜比视界、BT.2020 素材。会重新编码为 H.264 / yuv420p / BT.709，适合抖快平台。")
@@ -680,6 +698,12 @@ class AVProcessingMixin:
         layout.addWidget(title)
         layout.addWidget(desc)
 
+        # 左右分栏：左侧参数控件，右侧整栏大预览
+        body = QHBoxLayout()
+        body.setSpacing(18)
+        left = QVBoxLayout()
+        left.setSpacing(12)
+
         self.av_sub_video_line = QLineEdit()
         self.av_sub_video_line.setPlaceholderText("选择或拖入一个/多个视频 — 切换子功能时将自动匹配上游输出")
         self.av_input_lines['add_subtitle'] = self.av_sub_video_line
@@ -687,154 +711,165 @@ class AVProcessingMixin:
         video_drop = FileDropArea("拖拽完整视频到这里，或点击选择一个/多个视频")
         video_drop.filesDropped.connect(lambda files: self.av_sub_video_line.setText(";".join(files)))
         video_drop.clicked.connect(lambda: self.choose_av_inputs(self.av_sub_video_line, "Video Files (*.mp4 *.mov *.avi *.mkv *.webm)"))
-        layout.addWidget(video_drop)
+        left.addWidget(video_drop)
         video_row = QHBoxLayout()
         video_row.addWidget(self.av_sub_video_line, stretch=1)
         clear_video_btn = QPushButton("清空视频")
         clear_video_btn.clicked.connect(self.av_sub_video_line.clear)
         video_row.addWidget(clear_video_btn)
-        layout.addLayout(video_row)
+        left.addLayout(video_row)
 
-        # 花字预设选择器（大预览格，直接显示渲染效果）
-        preset_label = QLabel("花字预设（点选即应用）")
-        preset_label.setObjectName("appSubtitle")
-        layout.addWidget(preset_label)
-        self.av_sub_style_scroll = QScrollArea()
-        self.av_sub_style_scroll.setWidgetResizable(True)
-        self.av_sub_style_scroll.setFrameShape(QFrame.NoFrame)
-        self.av_sub_style_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        self.av_sub_style_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
-        self.av_sub_style_scroll.setFixedHeight(150)
-        self.av_sub_style_scroll.setStyleSheet("QScrollArea{background:transparent;border:none;}")
-        av_sub_style_container = QWidget()
-        av_sub_style_grid = QGridLayout(av_sub_style_container)
-        av_sub_style_grid.setContentsMargins(0, 0, 0, 0)
-        av_sub_style_grid.setSpacing(6)
-        av_sub_style_cols = 3
-        self.av_sub_style_buttons = []
-        from services.subtitle_presets import SUB_STYLES as AV_SUB_STYLES
-        from services.subtitle_presets import render_style_swatch
-        from PyQt5.QtGui import QIcon
-        from PyQt5.QtCore import QSize
-        for idx, preset in enumerate(AV_SUB_STYLES):
-            btn = QPushButton()
-            btn.setCheckable(True)
-            btn.setToolTip(preset["name"])
-            btn.setFixedSize(104, 46)
-            swatch = render_style_swatch(preset)
-            if swatch:
-                btn.setIcon(QIcon(swatch))
-                btn.setIconSize(QSize(100, 42))
-            btn.setStyleSheet(
-                "QPushButton{background:#1E293B;border:1px solid #475569;border-radius:6px;padding:0;}"
-                "QPushButton:hover{border:2px solid #60A5FA;}"
-                "QPushButton:checked{border:3px solid #FACC15;background:#1E3A5F;}"
-            )
-            btn.clicked.connect(lambda checked=False, p=preset, b=btn: self._apply_av_sub_style_preset(p, b))
-            av_sub_style_grid.addWidget(btn, idx // av_sub_style_cols, idx % av_sub_style_cols)
-            self.av_sub_style_buttons.append(btn)
-        av_sub_style_container.setLayout(av_sub_style_grid)
-        self.av_sub_style_scroll.setWidget(av_sub_style_container)
-        layout.addWidget(self.av_sub_style_scroll)
+        # 字幕样式面板（花字预设 + 样式表单；预览放右侧大窗，与批量混剪共用一套预设体系）
+        from subtitle_style_panel import SubtitleStylePanel, SubtitlePreviewWidget
+        self.av_sub_style_panel = SubtitleStylePanel(
+            system_fonts=dict(getattr(self, 'sys_fonts', {}) or {}),
+            default_size=72,
+            show_preview=False,
+        )
+        left.addWidget(self.av_sub_style_panel)
 
-        # 字幕样式
-        style_group = QGroupBox("字幕样式")
-        style_layout = QFormLayout(style_group)
-
-        self.av_sub_font_combo = QComboBox()
-        self.av_sub_font_combo.addItem("微软雅黑")
-        self.av_sub_font_combo.addItems(sorted(getattr(self, 'sys_fonts', {}).keys()))
-        style_layout.addRow("字体:", self.av_sub_font_combo)
-
-        self.av_sub_size_spin = QSpinBox()
-        self.av_sub_size_spin.setRange(20, 180)
-        self.av_sub_size_spin.setValue(72)
-        style_layout.addRow("字号:", self.av_sub_size_spin)
-
-        self.av_sub_color_combo = QComboBox()
-        self.av_sub_color_combo.addItems(["#FFFFFF", "#FFFF00", "#00FFFF", "#FFD700", "#FF4500", "#00FF00", "#FF69B4"])
-        style_layout.addRow("颜色:", self.av_sub_color_combo)
-
-        self.av_sub_border_w_spin = QSpinBox()
-        self.av_sub_border_w_spin.setRange(0, 12)
-        self.av_sub_border_w_spin.setValue(4)
-        style_layout.addRow("描边粗细:", self.av_sub_border_w_spin)
-
-        self.av_sub_border_color_combo = QComboBox()
-        self.av_sub_border_color_combo.addItems(["#000000", "#FFFFFF", "#FF0000", "#003366"])
-        style_layout.addRow("描边颜色:", self.av_sub_border_color_combo)
-
-        self.av_sub_margin_spin = QSpinBox()
-        self.av_sub_margin_spin.setRange(0, 500)
-        self.av_sub_margin_spin.setValue(120)
-        style_layout.addRow("底部边距:", self.av_sub_margin_spin)
-        layout.addWidget(style_group)
-
-        hint = QLabel("识别引擎：优先 SenseVoice 本地模型，缺失时回退 Whisper。输出到音视频处理输出目录，不覆盖原视频。")
+        hint = QLabel("识别引擎：优先 Whisper 生成精准时间轴（字幕与语音停顿对齐），缺失时回退 SenseVoice 快速模式（时间轴为估算）。输出到音视频处理输出目录，不覆盖原视频。")
         hint.setObjectName("warningText")
         hint.setWordWrap(True)
-        layout.addWidget(hint)
+        left.addWidget(hint)
 
         # 仅导出字幕文件模式
         self.av_sub_export_chk = QCheckBox("仅导出字幕文件（不烧录到视频，生成 .srt / .ass）")
         self.av_sub_export_chk.setChecked(False)
-        layout.addWidget(self.av_sub_export_chk)
+        left.addWidget(self.av_sub_export_chk)
 
-        layout.addLayout(self.build_av_output_row())
+        left.addLayout(self.build_av_output_row())
 
         run_btn = QPushButton("开始添加字幕")
         run_btn.setObjectName("startButton")
         run_btn.clicked.connect(self.start_av_add_subtitle)
-        layout.addWidget(run_btn)
-        layout.addStretch()
+        left.addWidget(run_btn)
+        left.addStretch()
+        body.addLayout(left, stretch=5)
+
+        # 右：整栏大预览（与面板样式实时同步）
+        self.av_sub_preview_large = SubtitlePreviewWidget(width=400)
+        self.av_sub_style_panel.styleChanged.connect(
+            lambda: self.av_sub_preview_large.set_style(self.av_sub_style_panel.get_style())
+        )
+        self.av_sub_preview_large.set_style(self.av_sub_style_panel.get_style())
+        body.addLayout(self._av_sub_preview_right_col(), stretch=4)
+        layout.addLayout(body, stretch=1)
         return page
 
-    def _apply_av_sub_style_preset(self, preset, clicked_btn):
-        """点选花字预设：应用到「视频加字幕」的参数控件。"""
-        for btn in self.av_sub_style_buttons:
-            btn.setChecked(btn is clicked_btn)
-        if preset.get("font"):
-            idx = self.av_sub_font_combo.findText(preset["font"])
-            if idx >= 0:
-                self.av_sub_font_combo.setCurrentIndex(idx)
-        self.av_sub_size_spin.setValue(int(preset.get("size", 72)))
-        color_idx = self.av_sub_color_combo.findText(preset.get("color", "#FFFFFF"))
-        if color_idx >= 0:
-            self.av_sub_color_combo.setCurrentIndex(color_idx)
-        bcolor_idx = self.av_sub_border_color_combo.findText(preset.get("border_color", "#000000"))
-        if bcolor_idx >= 0:
-            self.av_sub_border_color_combo.setCurrentIndex(bcolor_idx)
-        self.av_sub_border_w_spin.setValue(int(preset.get("border_w", 4)))
-        self.av_sub_margin_spin.setValue(int(preset.get("margin_v", 120)))
-        self._current_av_sub_style_preset = preset
+    def _av_sub_preview_right_col(self):
+        """右侧大预览列（独立容器，预览随窗口内容自适应）。"""
+        col = QVBoxLayout()
+        col.addWidget(self.av_sub_preview_large)
+        col.addStretch()
+        return col
+
+    def _apply_av_sub_style_preset(self, preset, clicked_btn=None):
+        """兼容入口：预设应用已由 SubtitleStylePanel 内部处理。"""
+        if hasattr(self, "av_sub_style_panel"):
+            self.av_sub_style_panel.apply_preset(preset, clicked_btn)
+
+    def _apply_av_random_sub_style(self):
+        """兼容入口：随机已由 SubtitleStylePanel 内部处理。"""
+        if hasattr(self, "av_sub_style_panel"):
+            self.av_sub_style_panel.apply_random_style()
+
+    def _on_av_sub_video_changed(self, text):
+        """视频输入变化：后台抽中间帧 + 探测分辨率，更新预览。"""
+        first = next(
+            (p for p in self._split_input_paths(text.strip()) if os.path.exists(p)),
+            None,
+        )
+        if not first:
+            return
+
+        from PyQt5.QtGui import QPixmap
+
+        class _FrameThread(QThread):
+            frameReady = pyqtSignal(QPixmap, int, int)
+
+            def __init__(self, video, ffmpeg, ffprobe, parent=None):
+                super().__init__(parent)
+                self._video = video
+                self._ffmpeg = ffmpeg
+                self._ffprobe = ffprobe
+
+            def run(self):
+                try:
+                    tmp = os.path.join(
+                        os.environ.get("TEMP", "."), f"avsub_frame_{os.getpid()}.jpg"
+                    )
+                    dur_res = subprocess.run(
+                        [self._ffprobe, '-v', 'error', '-show_entries', 'format=duration',
+                         '-of', 'csv=p=0', self._video],
+                        capture_output=True, text=True, timeout=10,
+                    )
+                    try:
+                        duration = float((dur_res.stdout or "").strip())
+                    except ValueError:
+                        duration = 0.0
+                    seek = max(0.0, duration * 0.3)
+                    subprocess.run(
+                        [self._ffmpeg, '-y', '-hide_banner', '-loglevel', 'error',
+                         '-ss', f"{seek:.2f}", '-i', self._video,
+                         '-frames:v', '1', '-q:v', '3', tmp],
+                        capture_output=True, timeout=20,
+                    )
+                    pixmap = QPixmap(tmp) if os.path.exists(tmp) else QPixmap()
+                    try:
+                        os.remove(tmp)
+                    except OSError:
+                        pass
+
+                    size_res = subprocess.run(
+                        [self._ffprobe, '-v', 'error', '-select_streams', 'v:0',
+                         '-show_entries', 'stream=width,height',
+                         '-of', 'csv=p=0:s=x', self._video],
+                        capture_output=True, text=True, timeout=10,
+                    )
+                    width, height = 1080, 1920
+                    try:
+                        parts = (size_res.stdout or "").strip().split('x')
+                        width, height = int(parts[0]), int(parts[1])
+                    except (ValueError, IndexError):
+                        pass
+                    self.frameReady.emit(pixmap, width, height)
+                except Exception:
+                    self.frameReady.emit(QPixmap(), 1080, 1920)
+
+        ffmpeg = os.path.abspath(os.path.join(tools_dir(), 'ffmpeg.exe'))
+        ffprobe = os.path.abspath(os.path.join(tools_dir(), 'ffprobe.exe'))
+        self._av_sub_frame_thread = _FrameThread(first, ffmpeg, ffprobe)
+
+        def _on_ready(pixmap, width, height):
+            if hasattr(self, "av_sub_style_panel"):
+                self.av_sub_style_panel.set_video_frame(pixmap)
+                self.av_sub_style_panel.set_play_res(width, height)
+            if hasattr(self, "av_sub_preview_large"):
+                self.av_sub_preview_large.set_video_frame(pixmap)
+                self.av_sub_preview_large.set_play_res(width, height)
+            # 大预览同步面板当前样式（分辨率变了，比例跟随）
+            if hasattr(self, "av_sub_style_panel") and hasattr(self, "av_sub_preview_large"):
+                self.av_sub_preview_large.set_style(self.av_sub_style_panel.get_style())
+
+        self._av_sub_frame_thread.frameReady.connect(_on_ready)
+        self._av_sub_frame_thread.start()
 
     def start_av_add_subtitle(self):
         inputs = [p for p in self._split_input_paths(self.av_sub_video_line.text().strip()) if os.path.exists(p)]
         if not inputs:
             QMessageBox.warning(self, "缺少视频", "请先选择有效的视频文件。")
             return
-        # 确保字体可用（复用批量混剪的字体字典）
-        if not getattr(self, 'sys_fonts', None):
-            self.sys_fonts = {
-                "微软雅黑 (默认)": "C:/Windows/Fonts/msyh.ttc",
-                "黑体": "C:/Windows/Fonts/simhei.ttf",
-                "宋体": "C:/Windows/Fonts/simsun.ttc",
-            }
-        preset = getattr(self, '_current_av_sub_style_preset', {}) or {}
+        sub_style = (
+            self.av_sub_style_panel.get_style()
+            if hasattr(self, "av_sub_style_panel")
+            else {}
+        )
         self._start_av_task({
             'kind': 'add_subtitle',
             'input_text': self.av_sub_video_line.text().strip(),
             'export_only': self.av_sub_export_chk.isChecked(),
-            'sub_style': {
-                'font_name': self.av_sub_font_combo.currentText(),
-                'size': self.av_sub_size_spin.value(),
-                'color': self.av_sub_color_combo.currentText(),
-                'border_w': self.av_sub_border_w_spin.value(),
-                'border_color': self.av_sub_border_color_combo.currentText(),
-                'margin_v': self.av_sub_margin_spin.value(),
-                'shadow': int(preset.get('shadow', 0) or 0),
-                'bold': int(-1 if preset.get('bold', True) else 0),
-            },
+            'sub_style': sub_style,
             'suffix': '带字幕',
             'output_ext': 'mp4'
         })
@@ -1241,25 +1276,66 @@ class AVProcessingMixin:
         self.av_wm_font = QComboBox()
         self.av_wm_font.addItem("🎲 随机系统字体")
         self.av_wm_font.addItems(list(self.sys_fonts.keys()))
-        self.av_wm_size = QSpinBox(); self.av_wm_size.setRange(20, 300); self.av_wm_size.setValue(60)
-        self.av_wm_color = QComboBox(); self.populate_color_combo(self.av_wm_color); self.av_wm_color.addItem("🎲 随机颜色"); self.av_wm_color.setCurrentText("white")
-        self.av_wm_align = QComboBox(); self.av_wm_align.addItems(["左对齐", "居中对齐", "右对齐"]); self.av_wm_align.setCurrentText("居中对齐")
-        self.av_wm_line_spacing = QSpinBox(); self.av_wm_line_spacing.setRange(60, 300); self.av_wm_line_spacing.setValue(130); self.av_wm_line_spacing.setSuffix("%")
-        self.av_wm_letter_spacing = QSpinBox(); self.av_wm_letter_spacing.setRange(0, 40); self.av_wm_letter_spacing.setValue(0); self.av_wm_letter_spacing.setSuffix("px")
+        self.av_wm_size = QSpinBox()
+        self.av_wm_size.setRange(20, 300)
+        self.av_wm_size.setValue(60)
+        self.av_wm_color = QComboBox()
+        self.populate_color_combo(self.av_wm_color)
+        self.av_wm_color.addItem("🎲 随机颜色")
+        self.av_wm_color.setCurrentText("white")
+        self.av_wm_align = QComboBox()
+        self.av_wm_align.addItems(["左对齐", "居中对齐", "右对齐"])
+        self.av_wm_align.setCurrentText("居中对齐")
+        self.av_wm_line_spacing = QSpinBox()
+        self.av_wm_line_spacing.setRange(60, 300)
+        self.av_wm_line_spacing.setValue(130)
+        self.av_wm_line_spacing.setSuffix("%")
+        self.av_wm_letter_spacing = QSpinBox()
+        self.av_wm_letter_spacing.setRange(0, 40)
+        self.av_wm_letter_spacing.setValue(0)
+        self.av_wm_letter_spacing.setSuffix("px")
         self.av_wm_bold = QCheckBox("强制加粗")
-        self.av_wm_border_w = QSpinBox(); self.av_wm_border_w.setRange(0, 10); self.av_wm_border_w.setValue(2)
-        self.av_wm_border_color = QComboBox(); self.populate_color_combo(self.av_wm_border_color); self.av_wm_border_color.addItem("🎲 随机颜色"); self.av_wm_border_color.setCurrentText("black")
-        self.av_wm_x = QSpinBox(); self.av_wm_x.setRange(0, 3840); self.av_wm_x.setValue(540)
-        self.av_wm_y = QSpinBox(); self.av_wm_y.setRange(0, 3840); self.av_wm_y.setValue(960)
+        self.av_wm_border_w = QSpinBox()
+        self.av_wm_border_w.setRange(0, 10)
+        self.av_wm_border_w.setValue(2)
+        self.av_wm_border_color = QComboBox()
+        self.populate_color_combo(self.av_wm_border_color)
+        self.av_wm_border_color.addItem("🎲 随机颜色")
+        self.av_wm_border_color.setCurrentText("black")
+        self.av_wm_x = QSpinBox()
+        self.av_wm_x.setRange(0, 3840)
+        self.av_wm_x.setValue(540)
+        self.av_wm_y = QSpinBox()
+        self.av_wm_y.setRange(0, 3840)
+        self.av_wm_y.setValue(960)
 
         self.av_wm_mode_label = QLabel("新增模式：当前面板内容会作为一条新水印添加到列表")
         self.av_wm_mode_label.setWordWrap(True)
         self.av_wm_mode_label.setStyleSheet("color:#BBF7D0; background:#052E16; border:1px solid #22C55E; border-radius:8px; padding:7px; font-weight:bold;")
-        font_row = QHBoxLayout(); font_row.addWidget(self.av_wm_font, 2); font_row.addWidget(self.av_wm_size, 1)
-        color_row = QHBoxLayout(); color_row.addWidget(QLabel("字体颜色:")); color_row.addWidget(self.av_wm_color); color_row.addWidget(QLabel("对齐:")); color_row.addWidget(self.av_wm_align)
-        spacing_row = QHBoxLayout(); spacing_row.addWidget(QLabel("换行间隔:")); spacing_row.addWidget(self.av_wm_line_spacing); spacing_row.addWidget(QLabel("字间距:")); spacing_row.addWidget(self.av_wm_letter_spacing)
-        border_row = QHBoxLayout(); border_row.addWidget(self.av_wm_bold); border_row.addWidget(QLabel("描边:")); border_row.addWidget(self.av_wm_border_w); border_row.addWidget(QLabel("描边颜色:")); border_row.addWidget(self.av_wm_border_color)
-        coord_row = QHBoxLayout(); coord_row.addWidget(QLabel("X:")); coord_row.addWidget(self.av_wm_x); coord_row.addWidget(QLabel("Y:")); coord_row.addWidget(self.av_wm_y)
+        font_row = QHBoxLayout()
+        font_row.addWidget(self.av_wm_font, 2)
+        font_row.addWidget(self.av_wm_size, 1)
+        color_row = QHBoxLayout()
+        color_row.addWidget(QLabel("字体颜色:"))
+        color_row.addWidget(self.av_wm_color)
+        color_row.addWidget(QLabel("对齐:"))
+        color_row.addWidget(self.av_wm_align)
+        spacing_row = QHBoxLayout()
+        spacing_row.addWidget(QLabel("换行间隔:"))
+        spacing_row.addWidget(self.av_wm_line_spacing)
+        spacing_row.addWidget(QLabel("字间距:"))
+        spacing_row.addWidget(self.av_wm_letter_spacing)
+        border_row = QHBoxLayout()
+        border_row.addWidget(self.av_wm_bold)
+        border_row.addWidget(QLabel("描边:"))
+        border_row.addWidget(self.av_wm_border_w)
+        border_row.addWidget(QLabel("描边颜色:"))
+        border_row.addWidget(self.av_wm_border_color)
+        coord_row = QHBoxLayout()
+        coord_row.addWidget(QLabel("X:"))
+        coord_row.addWidget(self.av_wm_x)
+        coord_row.addWidget(QLabel("Y:"))
+        coord_row.addWidget(self.av_wm_y)
         form.addRow(self.av_wm_mode_label)
         form.addRow("水印文字:", self.av_wm_text)
         form.addRow("字体与大小:", font_row)
@@ -1447,7 +1523,8 @@ class AVProcessingMixin:
         stop_btn.setIcon(self.style().standardIcon(QStyle.SP_MediaStop))
         stop_btn.setToolTip("停止试听")
         stop_btn.clicked.connect(self.stop_trim_preview)
-        fmt = QComboBox(); fmt.addItems(["mp3", "wav"])
+        fmt = QComboBox()
+        fmt.addItems(["mp3", "wav"])
         control_row.addWidget(self.trim_play_btn)
         control_row.addWidget(stop_btn)
         control_row.addStretch()
@@ -1573,7 +1650,8 @@ class AVProcessingMixin:
         })
 
     def build_av_vocal_page(self):
-        fmt = QComboBox(); fmt.addItems(["wav", "mp3"])
+        fmt = QComboBox()
+        fmt.addItems(["wav", "mp3"])
         return self.build_av_tool_page(
             "去除背景音乐保留人声",
             "基础版会做高低频过滤、降噪和人声响度增强。真正的人声/伴奏分离后续可接入 Demucs/UVR 本地模型。",

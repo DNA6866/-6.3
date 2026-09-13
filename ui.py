@@ -1,3 +1,4 @@
+# ruff: noqa: E402
 import sys
 import os
 from paths import (
@@ -28,6 +29,8 @@ from utils import (
 )
 from services.platform_service import open_path
 from services.cache_service import run_cache_maintenance
+from services.thread_lifecycle_service import ThreadLifecycleRegistry
+from services.ui_layout_service import choose_window_layout
 from ui_components import (
     SplashScreen,
     configure_spinbox_for_direct_input,
@@ -237,6 +240,7 @@ class VideoMixerApp(ProjectQueueMixin, TaskMixin, UIHelpersMixin, ModeMixin, Con
         sys.excepthook = self.handle_uncaught_exception
         self._post_show_queued = False
         self._cache_maintenance_worker = None
+        self._thread_registry = ThreadLifecycleRegistry()
         self.init_batch_project_state()
 
         self.initUI()
@@ -282,6 +286,7 @@ class VideoMixerApp(ProjectQueueMixin, TaskMixin, UIHelpersMixin, ModeMixin, Con
         worker.completed.connect(self._on_cache_maintenance_completed, Qt.QueuedConnection)
         worker.finished.connect(self._on_cache_maintenance_worker_finished)
         self._cache_maintenance_worker = worker
+        self._thread_registry.register(worker, "缓存维护")
         worker.start()
 
     def _on_cache_maintenance_completed(self, result):
@@ -330,6 +335,7 @@ class VideoMixerApp(ProjectQueueMixin, TaskMixin, UIHelpersMixin, ModeMixin, Con
                     except Exception:
                         pass
                 placeholder = self.module_stack.widget(index)
+                real_page._thread_registry = self._thread_registry
                 configure_spinbox_for_direct_input(real_page)
                 self.module_stack.insertWidget(index, real_page)
                 self.module_stack.removeWidget(placeholder)
@@ -380,8 +386,18 @@ class VideoMixerApp(ProjectQueueMixin, TaskMixin, UIHelpersMixin, ModeMixin, Con
         self.setObjectName("root")
         self.apply_modern_theme()
         self.setWindowTitle('牛爷爷电商视频工具箱 V6.3')
-        self.resize(1890, 1185)
-        self.setMinimumSize(1360, 820)
+        screen = QApplication.primaryScreen()
+        available = screen.availableGeometry() if screen is not None else None
+        layout_profile = choose_window_layout(
+            available.width() if available is not None else 1920,
+            available.height() if available is not None else 1080,
+        )
+        self._window_layout_profile = layout_profile
+        self.resize(layout_profile.window_width, layout_profile.window_height)
+        self.setMinimumSize(
+            layout_profile.minimum_width,
+            layout_profile.minimum_height,
+        )
 
         central = QWidget()
         central.setObjectName("root")
@@ -391,7 +407,7 @@ class VideoMixerApp(ProjectQueueMixin, TaskMixin, UIHelpersMixin, ModeMixin, Con
 
         sidebar = QFrame()
         sidebar.setObjectName("sidebar")
-        sidebar.setFixedWidth(200)
+        sidebar.setFixedWidth(layout_profile.sidebar_width)
         side_layout = QVBoxLayout(sidebar)
         side_layout.setContentsMargins(10, 16, 10, 16)
         side_layout.setSpacing(7)
@@ -459,11 +475,21 @@ class VideoMixerApp(ProjectQueueMixin, TaskMixin, UIHelpersMixin, ModeMixin, Con
         content = QFrame()
         content.setObjectName("contentPanel")
         content_layout = QVBoxLayout(content)
-        content_layout.setContentsMargins(18, 14, 18, 14)
+        content_layout.setContentsMargins(
+            layout_profile.content_margin,
+            10 if layout_profile.compact_header else 14,
+            layout_profile.content_margin,
+            10 if layout_profile.compact_header else 14,
+        )
         content_layout.setSpacing(10)
 
         header_layout = QHBoxLayout()
-        app_title = QLabel("牛爷爷电商视频工具箱 ｜ 商业混剪 / 快速剪辑 / 混剪实验室 V2 / 音视频处理 / AI工具")
+        title_text = (
+            "牛爷爷电商视频工具箱 ｜ 混剪 / 快剪 / V2 / 音视频 / AI"
+            if layout_profile.compact_header
+            else "牛爷爷电商视频工具箱 ｜ 商业混剪 / 快速剪辑 / 混剪实验室 V2 / 音视频处理 / AI工具"
+        )
+        app_title = QLabel(title_text)
         app_title.setObjectName("appTitle")
         app_title.setWordWrap(False)
         header_layout.addWidget(app_title)
@@ -479,9 +505,11 @@ class VideoMixerApp(ProjectQueueMixin, TaskMixin, UIHelpersMixin, ModeMixin, Con
 
         self.module_stack.setMinimumHeight(0)
         content_layout.addWidget(self.module_stack, stretch=1)
-        self.log_console = QTextEdit(); self.log_console.setObjectName("logConsole"); self.log_console.setReadOnly(True)
-        self.log_console.setMinimumHeight(68)
-        self.log_console.setMaximumHeight(110)
+        self.log_console = QTextEdit()
+        self.log_console.setObjectName("logConsole")
+        self.log_console.setReadOnly(True)
+        self.log_console.setMinimumHeight(layout_profile.log_minimum_height)
+        self.log_console.setMaximumHeight(layout_profile.log_maximum_height)
         content_layout.addWidget(QLabel("执行日志:"))
         content_layout.addWidget(self.log_console, stretch=0)
 
@@ -495,12 +523,22 @@ class VideoMixerApp(ProjectQueueMixin, TaskMixin, UIHelpersMixin, ModeMixin, Con
         self.apply_best_performance_profile(silent=False)
         
     def open_output_folder(self):
-        try: open_path(self.tab_folders.get('保存视频', workspace_path('输出', '保存视频')))
+        try:
+            open_path(
+                self.tab_folders.get(
+                    '保存视频',
+                    workspace_path('输出', '保存视频'),
+                )
+            )
         except Exception as exc:
             print(f"[打开目录] 打开输出文件夹失败：{exc}", flush=True)
             self.update_log(f"[打开目录] 打开输出文件夹失败：{exc}")
         
     def stop_and_clean(self):
+        self.cancel_pending_asset_refresh()
+        if getattr(self, '_daily_worker', None) is not None:
+            self.batch_project_repo.suspend_daily(True)
+            self._daily_worker.requestInterruption()
         engine = getattr(self, 'engine_thread', None)
         if engine is not None and engine.isRunning():
             if getattr(self, '_active_queue_task_id', ''):
@@ -511,7 +549,8 @@ class VideoMixerApp(ProjectQueueMixin, TaskMixin, UIHelpersMixin, ModeMixin, Con
                 engine.terminate()
                 engine.wait(3000)
             self.log_console.append("\n[任务控制] 已终止当前混剪任务并回收本任务的底层进程。\n")
-            self.start_btn.setEnabled(True); self.start_btn.setText("开始执行任务")
+            self.start_btn.setEnabled(True)
+            self.start_btn.setText("开始执行任务")
         self.clear_cache()
         
     def clear_cache(self, silent=False):
@@ -519,10 +558,13 @@ class VideoMixerApp(ProjectQueueMixin, TaskMixin, UIHelpersMixin, ModeMixin, Con
             p = os.path.abspath(self.cache_dir)
             if os.path.exists(p):
                 for f in os.listdir(p):
-                    if f.startswith("preview_bg_"): continue
+                    if f.startswith("preview_bg_"):
+                        continue
                     fp = os.path.join(p, f)
-                    if os.path.isfile(fp): os.remove(fp)
-            if not silent: self.log_console.append("[系统缓存] ♻️ 已手动释放。")
+                    if os.path.isfile(fp):
+                        os.remove(fp)
+            if not silent:
+                self.log_console.append("[系统缓存] ♻️ 已手动释放。")
         except Exception:
             print("[警告] 缓存清理失败", flush=True)
         
@@ -544,26 +586,11 @@ class VideoMixerApp(ProjectQueueMixin, TaskMixin, UIHelpersMixin, ModeMixin, Con
     def _stop_qthread_worker(self, worker, wait_ms=3000, terminate_ms=1500):
         if worker is None:
             return
-        try:
-            if not worker.isRunning():
-                return
-        except Exception:
-            return
-        try:
-            if hasattr(worker, "requestInterruption"):
-                worker.requestInterruption()
-        except Exception:
-            pass
-        try:
-            if worker.wait(wait_ms):
-                return
-        except Exception:
-            return
-        try:
-            worker.terminate()
-            worker.wait(terminate_ms)
-        except Exception:
-            pass
+        self._thread_registry.register(worker, worker.__class__.__name__)
+        self._thread_registry.shutdown(
+            timeout_ms=max(wait_ms, terminate_ms),
+            force=True,
+        )
 
     def _shutdown_ui_background_workers(self):
         try:
@@ -622,6 +649,24 @@ class VideoMixerApp(ProjectQueueMixin, TaskMixin, UIHelpersMixin, ModeMixin, Con
                 self.update_log(f"[窗口] 子模块关闭前清理失败：{exc}")
             except Exception:
                 pass
+        try:
+            values = list(vars(self).values())
+            if hasattr(self, "module_stack"):
+                for index in range(self.module_stack.count()):
+                    page = self.module_stack.widget(index)
+                    values.extend(vars(page).values())
+            self._thread_registry.adopt_values(values, "窗口关闭")
+            shutdown_result = self._thread_registry.shutdown(
+                timeout_ms=12000,
+                force=True,
+            )
+            if shutdown_result.get("forced"):
+                self.update_log(
+                    "[线程回收] 以下任务超时后已最终回收："
+                    + "、".join(shutdown_result["forced"])
+                )
+        except Exception:
+            pass
         super().closeEvent(event)
         try:
             self.deleteLater()

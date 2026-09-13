@@ -1162,7 +1162,8 @@ class MixerV2Widget(QWidget):
         self.smart_sfx_check = QCheckBox("启用")
         self.smart_sfx_check.setChecked(False)
         self.smart_sfx_check.setToolTip(
-            "根据片头、替换片段、转场和收尾自动加入结构音效。"
+            "根据片头、替换片段、转场和收尾匹配真实短音效，"
+            "并自动避开连续重复。"
         )
         self.smart_sfx_strength_combo = NoWheelComboBox()
         self.smart_sfx_strength_combo.addItem("轻量（少而克制）", "light")
@@ -1171,7 +1172,8 @@ class MixerV2Widget(QWidget):
         self.smart_sfx_strength_combo.setCurrentIndex(1)
         self.smart_sfx_strength_combo.setEnabled(False)
         self.smart_sfx_strength_combo.setToolTip(
-            "内置 16 类共 192 个音色，连续音效不会重复；首次使用后自动缓存。"
+            "优先使用本机剪映已经下载的音效；强度影响数量与响度。"
+            "也会读取“用户工作区\\素材\\智能音效”中的自定义音效。"
         )
         self.smart_sfx_check.toggled.connect(self._on_sfx_settings_changed)
         self.smart_sfx_strength_combo.currentIndexChanged.connect(
@@ -3811,6 +3813,9 @@ class MixerV2Widget(QWidget):
         worker.completed.connect(self._on_render_completed)
         worker.finished.connect(lambda: self._clear_render_worker(worker))
         self.render_worker = worker
+        registry = getattr(self, "_thread_registry", None)
+        if registry is not None:
+            registry.register(worker, f"V2生成:{task.project_name}", worker.stop)
         self.render_status.setText(
             f"正在生成“{task.project_name}”；"
             f"已确认替换片段：{task.replacement_text or '无'}。"

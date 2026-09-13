@@ -16,10 +16,10 @@ from PyQt5.QtGui import QGuiApplication, QRawFont
 from services.asr_service import (
     SenseVoiceIsolatedSession,
     clean_asr_text,
+    detect_silence_intervals,
     layout_subtitle_text,
     sensevoice_model_ready,
     transcribe_with_whisper_word_timestamps,
-    write_srt_from_text,
 )
 from utils import (
     COVER_RANDOM_STATIC_STYLES,
@@ -37,12 +37,14 @@ from services.render_task import (
     parse_target_resolution,
 )
 from services.asset_usage_service import AssetUsageScheduler
+from services.adaptive_concurrency_service import choose_render_concurrency
 from services.platform_service import is_remote_path
 from services.cache_service import touch_cache_entry
 from services.lut_service import resolve_lut_selection
 from services.smart_sfx_service import (
     build_sfx_mix_filters,
     plan_smart_sfx,
+    smart_sfx_origin_summary,
     smart_sfx_strength_label,
 )
 from services.render_planner import (
@@ -57,6 +59,17 @@ from services.render_checkpoint_service import (
     ensure_resume_source_ids,
     resume_job_key,
 )
+from services.fast_render_pipeline import (
+    FastRenderRequest,
+    execute_fast_render,
+)
+from services.media_validation_service import (
+    atomic_media_path,
+    replace_command_output,
+    validate_media_output,
+)
+from services.media_index_service import get_media_index
+from services.render_metrics_service import RenderStageProfiler
 from paths import APP_ROOT, config_dir, logs_dir, models_dir, resource_root_candidates, tools_dir, workspace_path
 
 DRAWTEXT_FONT_PROBE_VERSION = 3
@@ -98,6 +111,8 @@ class SynthesisEngine(QThread):
         self._standard_cache_locks = {}
         self._standard_cache_locks_guard = threading.Lock()
         self._standard_cache_requests = {}
+        self._render_profiler_local = threading.local()
+        self._media_index = get_media_index()
         self._asset_usage_scheduler = AssetUsageScheduler()
         self._resume_checkpoint_path = str(
             raw_task_data.get("resume_checkpoint_path") or ""
@@ -107,6 +122,12 @@ class SynthesisEngine(QThread):
             RenderCheckpointStore(
                 self._resume_checkpoint_path,
                 task_id=self._resume_task_id,
+                output_validator=lambda path: validate_media_output(
+                    self.ffprobe_exe,
+                    path,
+                    require_video=True,
+                    minimum_bytes=1024,
+                )[0],
             )
             if self._resume_checkpoint_path else None
         )
@@ -117,6 +138,12 @@ class SynthesisEngine(QThread):
     def _refresh_task_config(self):
         self.task_config = self.task.config
         return self.task_config
+
+    def _current_render_profiler(self):
+        return getattr(self._render_profiler_local, "profiler", None)
+
+    def _mark_current_render_success(self):
+        self._render_profiler_local.success = True
 
     def stop(self):
         self.is_running = False
@@ -305,6 +332,7 @@ class SynthesisEngine(QThread):
         output_path = self._ffmpeg_output_path(cmd, cwd)
         max_runtime = max(600.0, min(3600.0, 300.0 + duration_hint * 30.0))
         started_at = time.monotonic()
+        completed_ok = False
         last_progress_at = started_at
         last_heartbeat_at = started_at
         last_output_size = -1
@@ -358,11 +386,19 @@ class SynthesisEngine(QThread):
                 returncode = process.returncode
                 output_file.seek(0)
                 output = output_file.read().decode("utf-8", errors="ignore")
+                completed_ok = returncode == 0
                 return returncode, output
         finally:
             if process is not None:
                 with self._process_lock:
                     self._active_processes.pop(process.pid, None)
+            profiler = self._current_render_profiler()
+            if profiler is not None:
+                profiler.record_ffmpeg(
+                    output_path,
+                    time.monotonic() - started_at,
+                    completed_ok,
+                )
 
     def run_ffmpeg(self, cmd, cwd=None):
         try:
@@ -402,10 +438,74 @@ class SynthesisEngine(QThread):
             self.log_signal.emit(f"❌ 进程异常: {e}")
             return False
 
+    def run_ffmpeg_atomic(
+        self,
+        cmd,
+        output_path,
+        cwd=None,
+        minimum_bytes=1024,
+        require_video=True,
+        retries=1,
+    ):
+        """先写同扩展名临时文件，校验通过后替换目标，避免下游读到半成品。"""
+        output_path = os.path.abspath(str(output_path or ""))
+        if not output_path:
+            return False
+        os.makedirs(os.path.dirname(output_path), exist_ok=True)
+        last_detail = ""
+        for attempt in range(max(0, int(retries or 0)) + 1):
+            temporary_path = atomic_media_path(output_path)
+            try:
+                atomic_command = replace_command_output(
+                    cmd,
+                    output_path,
+                    temporary_path,
+                )
+                rendered = self.run_ffmpeg(atomic_command, cwd=cwd)
+                if not rendered:
+                    last_detail = "FFmpeg 节点执行失败"
+                else:
+                    valid, detail = validate_media_output(
+                        self.ffprobe_exe,
+                        temporary_path,
+                        require_video=require_video,
+                        minimum_bytes=minimum_bytes,
+                    )
+                    if valid:
+                        os.replace(temporary_path, output_path)
+                        return True
+                    last_detail = detail or "媒体完整性校验失败"
+            except (OSError, ValueError) as exc:
+                last_detail = str(exc)
+            finally:
+                try:
+                    if os.path.isfile(temporary_path):
+                        os.remove(temporary_path)
+                except OSError:
+                    pass
+            if attempt < max(0, int(retries or 0)):
+                self.log_signal.emit(
+                    f"[节点重试] 中间媒体未通过完整性校验，"
+                    f"正在重做当前节点 {attempt + 2} 次：{last_detail}"
+                )
+        self.log_signal.emit(
+            f"[节点失败] 中间媒体连续校验失败："
+            f"{os.path.basename(output_path)}；{last_detail or '未知原因'}"
+        )
+        return False
+
     def get_duration(self, file_path):
         cache = self.task.duration_cache
         if file_path in cache:
             return cache[file_path]
+        indexed = self._media_index.metadata(file_path)
+        try:
+            indexed_duration = float(indexed.get("duration") or 0.0)
+        except (TypeError, ValueError):
+            indexed_duration = 0.0
+        if indexed_duration > 0.0:
+            cache[file_path] = indexed_duration
+            return indexed_duration
         try:
             cmd = [self.ffprobe_exe, '-v', 'error', '-show_entries', 
                    'format=duration', '-of', 'default=noprint_wrappers=1:nokey=1', file_path]
@@ -420,6 +520,7 @@ class SynthesisEngine(QThread):
             )
             dur = float(result.stdout.strip())
             cache[file_path] = dur 
+            self._media_index.update_metadata(file_path, duration=dur)
             return dur
         except Exception:
             return 0.0
@@ -553,6 +654,21 @@ class SynthesisEngine(QThread):
             return {}
         if key in self._video_color_cache:
             return self._video_color_cache[key]
+        indexed = self._media_index.metadata(key)
+        indexed_info = {
+            name: str(indexed.get(name) or "").lower()
+            for name in (
+                "pix_fmt",
+                "color_space",
+                "color_transfer",
+                "color_primaries",
+                "color_range",
+            )
+            if indexed.get(name) is not None
+        }
+        if indexed_info:
+            self._video_color_cache[key] = indexed_info
+            return indexed_info
         info = {}
         try:
             cmd = [
@@ -579,6 +695,8 @@ class SynthesisEngine(QThread):
         except Exception:
             info = {}
         self._video_color_cache[key] = info
+        if info:
+            self._media_index.update_metadata(key, **info)
         return info
 
     def _is_hdr_video(self, file_path):
@@ -782,6 +900,20 @@ class SynthesisEngine(QThread):
         cached = self._video_shape_cache.get(key)
         if cached and cached[0] == stamp:
             return dict(cached[1])
+        indexed = self._media_index.metadata(key)
+        if (
+            int(indexed.get("width") or 0) > 0
+            and int(indexed.get("height") or 0) > 0
+            and indexed.get("codec_name")
+        ):
+            info = {
+                "codec_name": str(indexed.get("codec_name") or ""),
+                "width": str(indexed.get("width") or ""),
+                "height": str(indexed.get("height") or ""),
+                "pix_fmt": str(indexed.get("pix_fmt") or ""),
+            }
+            self._video_shape_cache[key] = (stamp, dict(info))
+            return info
         try:
             cmd = [
                 self.ffprobe_exe, '-v', 'error',
@@ -806,6 +938,13 @@ class SynthesisEngine(QThread):
                 name, value = line.split("=", 1)
                 info[name.strip()] = value.strip().lower()
             self._video_shape_cache[key] = (stamp, dict(info))
+            self._media_index.update_metadata(
+                key,
+                codec_name=info.get("codec_name"),
+                width=int(info.get("width") or 0),
+                height=int(info.get("height") or 0),
+                pix_fmt=info.get("pix_fmt"),
+            )
             return info
         except Exception:
             return {}
@@ -1546,7 +1685,13 @@ class SynthesisEngine(QThread):
                 elif is_bold and border_w > 0:
                     actual_bw = border_w + 1
                 border_cmd = f"borderw={actual_bw}:bordercolor={actual_bc}:" if actual_bw > 0 else ""
-                wm_str += f",drawtext={delay_filter}{font_cmd}textfile='{safe_txt_file}':fontsize={size}:fontcolor={color}:{border_cmd}x={x_expr}:y={y_expr}:alpha='{alpha}'"
+                # 花字预设阴影（shadow 秒数 → drawtext shadowx/shadowy/shadowcolor）
+                shadow_cmd = ""
+                wm_shadow = int(wm.get('shadow', 0) or 0)
+                if wm_shadow > 0:
+                    shadow_off = max(1, int(round(wm_shadow * font_scale)))
+                    shadow_cmd = f"shadowx={shadow_off}:shadowy={shadow_off}:shadowcolor=black@0.7:"
+                wm_str += f",drawtext={delay_filter}{font_cmd}textfile='{safe_txt_file}':fontsize={size}:fontcolor={color}:{border_cmd}{shadow_cmd}x={x_expr}:y={y_expr}:alpha='{alpha}'"
         return wm_str
 
     def process_asr_and_color(self, audio_path, cache_dir, audio_name, sub_config, sys_fonts, gpu_mode, timeline_offset=0.0):
@@ -1576,6 +1721,7 @@ class SynthesisEngine(QThread):
                         cache_dir,
                         f"word_timeline_{random.randint(10000, 99999)}.srt",
                     )
+                    silence_intervals = detect_silence_intervals(self.ffmpeg_exe, audio_path)
                     actual_srt, word_segments = transcribe_with_whisper_word_timestamps(
                         whisper_exe,
                         models[0],
@@ -1583,6 +1729,7 @@ class SynthesisEngine(QThread):
                         audio_path,
                         word_srt_path,
                         timeout_sec=900,
+                        silence_intervals=silence_intervals,
                     )
                     temp_srt_path = actual_srt
                     self.log_signal.emit(
@@ -1600,9 +1747,15 @@ class SynthesisEngine(QThread):
                 session = self._get_sensevoice_session()
                 text, device = session.transcribe(audio_path, timeout_sec=300)
                 audio_dur = self.get_duration(audio_path)
-                write_srt_from_text(text, audio_dur, temp_srt_path)
+                # SenseVoice 无时间戳：按语音停顿点对齐分句，替代按总时长均分（减少字幕漂移）
+                silence_points = self._audio_silence_points(audio_path)
+                from services.asr_service import write_srt_aligned_from_text
+                write_srt_aligned_from_text(text, audio_dur, silence_points, temp_srt_path)
                 actual_srt = temp_srt_path
-                self.log_signal.emit(f"✅ SenseVoice 字幕识别完成（隔离进程，设备：{device}）。")
+                self.log_signal.emit(
+                    f"✅ SenseVoice 字幕识别完成（隔离进程，设备：{device}；"
+                    f"时间轴按停顿估算，建议开启词级时间轴获得精准对齐）。"
+                )
             except Exception as e:
                 self.log_signal.emit(f"⚠️ SenseVoice 识别失败，尝试 Whisper 回退: {e}")
 
@@ -1797,15 +1950,19 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
                         i += 1
                     text = " ".join(text_lines)
                     if text:
-                        text, event_font_size = layout_subtitle_text(
+                        # 字号恒定：超宽时自动多行（行数自适应），不再缩小字号——
+                        # 与视频加字幕保持一致，避免同批成片字号忽大忽小。
+                        text, _event_font_size = layout_subtitle_text(
                             text,
                             font_size=sub_config.get('size', 85),
                             play_res_x=1080,
                             margin_side=margin_side,
+                            max_lines=3,
+                            allow_shrink=False,
                         )
                         events.append(
                             f"Dialogue: 0,{start},{end},Default,,0,0,0,,"
-                            f"{event_override(event_font_size)}{text}"
+                            f"{event_override()}{text}"
                         )
                 i += 1
             with open(ass_out_path, 'w', encoding='utf-8') as f:
@@ -1970,10 +2127,13 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
             '-t', f"{plan.duration:.3f}",
             *enc_args, '-an', '-r', '30', '-pix_fmt', pix_fmt, output_path,
         ]
-        return (
-            self.run_ffmpeg(command, cwd=cache_dir)
-            and os.path.exists(output_path)
-            and os.path.getsize(output_path) > 1024
+        return self.run_ffmpeg_atomic(
+            command,
+            output_path,
+            cwd=cache_dir,
+            minimum_bytes=1024,
+            require_video=True,
+            retries=1,
         )
 
     def _merge_xfade_hierarchy(
@@ -2053,7 +2213,14 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
         if duration is not None:
             command.extend(['-t', f"{float(duration):.3f}"])
         command.extend(['-c:v', 'copy', output_path])
-        return self.run_ffmpeg(command, cwd=cache_dir)
+        return self.run_ffmpeg_atomic(
+            command,
+            output_path,
+            cwd=cache_dir,
+            minimum_bytes=1024,
+            require_video=True,
+            retries=1,
+        )
 
     def _build_dissolve_fill(
         self,
@@ -2403,10 +2570,77 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
                 '-vf', video_filter, *enc_args, '-an', '-r', '30',
                 '-pix_fmt', pix_fmt, output_path,
             ]
-            if not self.run_ffmpeg(command, cwd=cache_dir):
+            if not self.run_ffmpeg_atomic(
+                command,
+                output_path,
+                cwd=cache_dir,
+                minimum_bytes=1024,
+                require_video=True,
+                retries=1,
+            ):
                 return None
             rendered.append(output_path)
         return rendered
+
+    def _render_traditional_video_fast(
+        self,
+        clip_plan,
+        output_path,
+        cache_dir,
+        unique_id,
+        render_sampler,
+        filter_builder,
+        anti_dedup,
+        use_trans,
+        trans_dur,
+        transition_selector,
+        enc_args,
+        pix_fmt,
+        resolved_watermarks,
+        target_w,
+        target_h,
+    ):
+        """常规混剪单进程渲染；任何不兼容都会返回 False 交给旧管线。"""
+        if os.environ.get("NIUYEYE_DISABLE_FAST_RENDER") == "1":
+            return False
+        if not bool(getattr(self.task_config, "fast_render_enabled", True)):
+            return False
+        try:
+            rendered = execute_fast_render(
+                FastRenderRequest(
+                    ffmpeg_path=self.ffmpeg_exe,
+                    clip_plan=clip_plan,
+                    output_path=output_path,
+                    cache_dir=cache_dir,
+                    unique_id=unique_id,
+                    render_sampler=render_sampler,
+                    filter_builder=filter_builder,
+                    anti_dedup=anti_dedup,
+                    use_transitions=use_trans,
+                    transition_duration=trans_dur,
+                    transition_selector=transition_selector,
+                    encoder_args=enc_args,
+                    pixel_format=pix_fmt,
+                    watermarks=resolved_watermarks,
+                    target_width=int(target_w),
+                    target_height=int(target_h),
+                    watermark_filter_builder=self.generate_watermark_filter,
+                    atomic_runner=self.run_ffmpeg_atomic,
+                    emit=self.log_signal.emit,
+                )
+            )
+            if rendered:
+                return True
+            self.log_signal.emit(
+                f"[{unique_id}] [快速管线] 当前素材组合不兼容，"
+                "已自动切回原稳定渲染路径。"
+            )
+            return False
+        except Exception as exc:
+            self.log_signal.emit(
+                f"[{unique_id}] [快速管线] 规划失败，自动使用稳定路径：{exc}"
+            )
+            return False
 
     def _assemble_traditional_video(
         self,
@@ -2884,13 +3118,12 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
         platform_video_filter = (
             f"setsar=1,setdar=dar={int(target_w)}/{int(target_h)}"
         )
-        mix_command_base = list(mix_command) + ['-vf', platform_video_filter]
-        mix_command = list(mix_command_base)
+        mix_command_base = list(mix_command)
         subtitle_added = False
         if final_ass_path and os.path.exists(final_ass_path):
             subtitle_filter = self.build_subtitle_filter(final_ass_path)
             self.log_signal.emit(f"✅ 智能字幕文件已生成，准备烧录：{final_ass_path}")
-            mix_command = list(mix_command[:-2])
+            mix_command = list(mix_command_base)
             mix_command.extend([
                 '-vf',
                 f"{color_normalize_filter},{platform_video_filter},{subtitle_filter}",
@@ -2901,20 +3134,36 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
                 "⚠️ 已开启智能字幕，但没有生成可用字幕文件，本条视频将不烧录字幕。"
             )
 
-        suffix = [
-            *final_enc_args, '-pix_fmt', pix_fmt,
+        common_suffix = [
             '-c:a', 'aac', '-b:a', '128k', '-ar', '44100', '-ac', '2',
-            '-r', '30',
             '-aspect', f"{int(target_w)}:{int(target_h)}",
             '-metadata:s:v:0', 'rotate=0',
             '-video_track_timescale', '30000',
             '-shortest', '-avoid_negative_ts', 'make_zero',
             '-movflags', '+faststart', temp_output,
         ]
-        mix_command.extend(suffix)
+        encoded_suffix = [
+            *final_enc_args,
+            '-pix_fmt', pix_fmt,
+            '-r', '30',
+            *common_suffix,
+        ]
+        copy_suffix = ['-c:v', 'copy', *common_suffix]
+        video_copy_used = not subtitle_added
+        if subtitle_added:
+            mix_command.extend(encoded_suffix)
+        else:
+            mix_command = list(mix_command_base) + copy_suffix
         action = "烧录字幕并封装最终视频" if subtitle_added else "封装音频到最终视频"
         self.log_signal.emit(f"[{unique_id}] 正在{action}...")
-        mix_ok = self.run_ffmpeg(mix_command, cwd=cache_dir)
+        mix_ok = self.run_ffmpeg_atomic(
+            mix_command,
+            temp_output,
+            cwd=cache_dir,
+            minimum_bytes=1024,
+            require_video=True,
+            retries=0,
+        )
         if not mix_ok and subtitle_added:
             self.log_signal.emit(
                 f"[{unique_id}] ⚠️ 字幕烧录节点失败，自动重试无字幕封装，保证先输出成片。"
@@ -2924,7 +3173,43 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
                     os.remove(temp_output)
             except Exception:
                 pass
-            mix_ok = self.run_ffmpeg(mix_command_base + suffix, cwd=cache_dir)
+            mix_ok = self.run_ffmpeg_atomic(
+                mix_command_base + copy_suffix,
+                temp_output,
+                cwd=cache_dir,
+                minimum_bytes=1024,
+                require_video=True,
+                retries=0,
+            )
+            video_copy_used = bool(mix_ok)
+            if not mix_ok:
+                mix_ok = self.run_ffmpeg_atomic(
+                    mix_command_base
+                    + ['-vf', platform_video_filter]
+                    + encoded_suffix,
+                    temp_output,
+                    cwd=cache_dir,
+                    minimum_bytes=1024,
+                    require_video=True,
+                    retries=0,
+                )
+                video_copy_used = False
+        elif not mix_ok and video_copy_used:
+            self.log_signal.emit(
+                f"[{unique_id}] [快速封装] 视频流直拷失败，"
+                "当前条自动退回完整编码。"
+            )
+            mix_ok = self.run_ffmpeg_atomic(
+                mix_command_base
+                + ['-vf', platform_video_filter]
+                + encoded_suffix,
+                temp_output,
+                cwd=cache_dir,
+                minimum_bytes=1024,
+                require_video=True,
+                retries=0,
+            )
+            video_copy_used = False
 
         if mix_ok and os.path.exists(temp_output) and os.path.getsize(temp_output) > 1024:
             compliance_issues, compliance = self._validate_platform_output(
@@ -2932,6 +3217,32 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
                 target_w,
                 target_h,
             )
+            if compliance_issues and video_copy_used:
+                self.log_signal.emit(
+                    f"[{unique_id}] [快速封装] 直拷结果未通过平台规格校验，"
+                    "正在自动重编码修正。"
+                )
+                try:
+                    os.remove(temp_output)
+                except OSError:
+                    pass
+                mix_ok = self.run_ffmpeg_atomic(
+                    mix_command_base
+                    + ['-vf', platform_video_filter]
+                    + encoded_suffix,
+                    temp_output,
+                    cwd=cache_dir,
+                    minimum_bytes=1024,
+                    require_video=True,
+                    retries=0,
+                )
+                video_copy_used = False
+                if mix_ok:
+                    compliance_issues, compliance = self._validate_platform_output(
+                        temp_output,
+                        target_w,
+                        target_h,
+                    )
             if compliance_issues:
                 mix_ok = False
                 self.status_update_signal.emit(audio_row, "❌ 平台规格异常", "red")
@@ -2965,6 +3276,7 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
                         )
                 self.log_signal.emit(f"[{unique_id}] ✅ 已成功封装输出：{final_output}\n")
                 self._asset_usage_scheduler.finish_job(unique_id, successful=True)
+                self._mark_current_render_success()
                 self.task_done_signal.emit()
                 if round_idx == total_rounds:
                     self.status_update_signal.emit(audio_row, "✅ 全部完成", "green")
@@ -2976,9 +3288,77 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
             self.log_signal.emit(f"[{unique_id}] ❌ 混合封装过程发生崩溃！")
         return ai_intro_silent_audio
 
-    def process_single_audio(self, audio_dict, video_pool, bgm_pool, min_clip, max_clip, gpu_mode, 
-                             target_res, trans_type, trans_dur, cache_dir, output_dir, covers, watermarks, 
-                             round_idx, total_rounds, main_vol, bgm_vol):
+    @staticmethod
+    def _jitter_value(value, ratio, low, high):
+        """把固定参数抖动为 [value*(1-ratio), value*(1+ratio)] 内的随机值。
+
+        ratio=0 时返回原值；结果会被裁剪到 [low, high]，保证不越出 UI 合法范围。
+        """
+        try:
+            base = float(value or 0.0)
+        except (TypeError, ValueError):
+            return value
+        if ratio <= 0:
+            return base
+        jittered = base * random.uniform(1.0 - ratio, 1.0 + ratio)
+        return max(float(low), min(float(high), jittered))
+
+    def process_single_audio(
+        self,
+        audio_dict,
+        video_pool,
+        bgm_pool,
+        min_clip,
+        max_clip,
+        gpu_mode,
+        target_res,
+        trans_type,
+        trans_dur,
+        cache_dir,
+        output_dir,
+        covers,
+        watermarks,
+        round_idx,
+        total_rounds,
+        main_vol,
+        bgm_vol,
+    ):
+        source_path = str((audio_dict or {}).get("path") or "")
+        source_name = os.path.splitext(os.path.basename(source_path))[0] or "未命名"
+        profiler = RenderStageProfiler(
+            f"{source_name}_回{round_idx}",
+            emit=self.log_signal.emit,
+        )
+        self._render_profiler_local.profiler = profiler
+        self._render_profiler_local.success = False
+        try:
+            return self._process_single_audio_impl(
+                audio_dict,
+                video_pool,
+                bgm_pool,
+                min_clip,
+                max_clip,
+                gpu_mode,
+                target_res,
+                trans_type,
+                trans_dur,
+                cache_dir,
+                output_dir,
+                covers,
+                watermarks,
+                round_idx,
+                total_rounds,
+                main_vol,
+                bgm_vol,
+            )
+        finally:
+            profiler.finish(bool(getattr(self._render_profiler_local, "success", False)))
+            self._render_profiler_local.profiler = None
+            self._render_profiler_local.success = False
+
+    def _process_single_audio_impl(self, audio_dict, video_pool, bgm_pool, min_clip, max_clip, gpu_mode,
+                                   target_res, trans_type, trans_dur, cache_dir, output_dir, covers, watermarks,
+                                   round_idx, total_rounds, main_vol, bgm_vol):
         if not self.is_running:
             return
 
@@ -3023,21 +3403,39 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
         if sub_config.get('enable'):
             sys_fonts = task_config.sys_fonts
             timeline_offset = ai_intro_duration + cover_duration
-            final_ass_path = self.process_asr_and_color(
-                audio_path,
-                cache_dir,
-                audio_name,
-                sub_config,
-                sys_fonts,
-                gpu_mode,
-                timeline_offset,
-            )
+            profiler = self._current_render_profiler()
+            if profiler is None:
+                final_ass_path = self.process_asr_and_color(
+                    audio_path,
+                    cache_dir,
+                    audio_name,
+                    sub_config,
+                    sys_fonts,
+                    gpu_mode,
+                    timeline_offset,
+                )
+            else:
+                with profiler.stage("字幕识别"):
+                    final_ass_path = self.process_asr_and_color(
+                        audio_path,
+                        cache_dir,
+                        audio_name,
+                        sub_config,
+                        sys_fonts,
+                        gpu_mode,
+                        timeline_offset,
+                    )
             
         audio_dur = self.get_duration(audio_path)
         smart_sfx_candidates = []
         if task_config.smart_sfx_enabled and ai_intro_mode:
             smart_sfx_candidates.append(
-                {"time": 0.0, "kind": "intro", "priority": 3}
+                {
+                    "time": 0.0,
+                    "kind": "intro",
+                    "priority": 3,
+                    "style": "cinematic",
+                }
             )
         use_trans = trans_type != "不使用转场"
         target_w_int, target_h_int = parse_target_resolution(
@@ -3067,8 +3465,23 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
         hook_duration = task_config.hook_duration
         strong_avatar_duration = task_config.strong_avatar_duration
         strong_avatar_smart_tail = task_config.strong_avatar_smart_tail
+        # 参数防重抖动：对「固定值参数」在 ±ratio 内随机浮动，让每条成片的时间轴
+        # 骨架（开头时长/强结构节点/转场时长/音量）都不同，降低平台判重复概率。
+        jitter_ratio = max(0.0, min(0.5, float(getattr(task_config, "param_jitter", 0.0) or 0.0)))
+        if jitter_ratio > 0:
+            hook_duration = self._jitter_value(hook_duration, jitter_ratio, 0.0, 8.0)
+            strong_avatar_duration = self._jitter_value(strong_avatar_duration, jitter_ratio, 0.8, 8.0)
+            # 转场时长与音量用较小幅度，避免节奏/听感差异过大
+            trans_dur = self._jitter_value(trans_dur, jitter_ratio * 0.6, 0.1, 2.0)
+            main_vol = self._jitter_value(main_vol, jitter_ratio * 0.5, 0.0, 10.0)
+            bgm_vol = self._jitter_value(bgm_vol, jitter_ratio * 0.5, 0.0, 2.0)
         strong_product_duration = task_config.strong_product_duration
         strong_avatar_count = task_config.strong_avatar_count
+        if jitter_ratio > 0:
+            strong_product_duration = self._jitter_value(strong_product_duration, jitter_ratio, 0.8, 10.0)
+            # 露出次数 ±1（抖动幅度越大越可能变化）
+            if random.random() < jitter_ratio * 2:
+                strong_avatar_count = max(1, min(5, strong_avatar_count + random.choice((-1, 1))))
         clip_rhythm = task_config.clip_rhythm
         clip_jitter = task_config.clip_jitter
         overlay_gap_min = task_config.overlay_gap_min
@@ -3166,6 +3579,7 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
         watermarked_main_v = ""
         concat_list = []
         transition_temp_files = []
+        watermarks_baked = False
         if first_track_videos:
             base_track = audio_path if use_first_track_audio else random.choice(first_track_videos)['path']
             base_track_video = cached_video_source(base_track, normalize=False)
@@ -3321,12 +3735,14 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
                         "time": main_offset + float(plan.get('global_start') or 0.0),
                         "kind": "hook" if source_type == "hook" else "product",
                         "priority": 3 if source_type == "hook" else 1,
+                        "style": source_type,
                     })
                 for avatar_start, _avatar_end in avatar_windows:
                     smart_sfx_candidates.append({
                         "time": main_offset + float(avatar_start),
                         "kind": "avatar",
                         "priority": 1,
+                        "style": "avatar",
                     })
 
             hook_count = len([p for p in overlay_plan if p.get('source_type') == 'hook'])
@@ -3469,39 +3885,64 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
                         "time": main_offset + float(plan.get('global_start') or 0.0),
                         "kind": "hook" if source_type == "hook" else "transition",
                         "priority": 3 if source_type == "hook" else 1,
+                        "style": (
+                            source_type
+                            if source_type == "hook"
+                            else TRANS_MAP.get(trans_type, trans_type)
+                        ),
                     })
-            concat_list = self._render_traditional_clips(
+            fast_rendered = self._render_traditional_video_fast(
                 clip_plan,
+                main_v_no_audio,
                 cache_dir,
                 unique_id,
                 render_sampler,
                 filter_builder,
                 anti_dedup,
                 use_trans,
-                enc_args,
-                pix_fmt,
-            )
-            if not concat_list:
-                return
-
-            if not self._assemble_traditional_video(
-                concat_list,
-                main_v_no_audio,
-                cache_dir,
-                unique_id,
-                use_trans,
                 trans_dur,
                 transition_selector,
                 enc_args,
                 pix_fmt,
-                transition_temp_files,
-            ):
-                return
+                resolved_watermarks,
+                target_w_int,
+                target_h_int,
+            )
+            if fast_rendered:
+                watermarks_baked = bool(resolved_watermarks)
+            else:
+                concat_list = self._render_traditional_clips(
+                    clip_plan,
+                    cache_dir,
+                    unique_id,
+                    render_sampler,
+                    filter_builder,
+                    anti_dedup,
+                    use_trans,
+                    enc_args,
+                    pix_fmt,
+                )
+                if not concat_list:
+                    return
+
+                if not self._assemble_traditional_video(
+                    concat_list,
+                    main_v_no_audio,
+                    cache_dir,
+                    unique_id,
+                    use_trans,
+                    trans_dur,
+                    transition_selector,
+                    enc_args,
+                    pix_fmt,
+                    transition_temp_files,
+                ):
+                    return
 
         if not self.is_running:
             return
 
-        if not first_track_videos and resolved_watermarks:
+        if not first_track_videos and resolved_watermarks and not watermarks_baked:
             watermarked_main_v = os.path.join(cache_dir, f"wm_main_{unique_id}.ts")
             watermark_vf = (
                 f"{color_normalize_filter},format={pix_fmt},fps=30,settb=1/90000"
@@ -3684,6 +4125,7 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
                 "time": max(0.0, total_audio_duration - 0.45),
                 "kind": "ending",
                 "priority": 2,
+                "style": "ending",
             })
             try:
                 smart_sfx_events = plan_smart_sfx(
@@ -3692,11 +4134,13 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
                     smart_sfx_candidates,
                     task_config.smart_sfx_strength,
                     unique_id,
+                    base_gain=main_vol,
                 )
                 self.log_signal.emit(
                     f"[{unique_id}] 智能音效："
                     f"{smart_sfx_strength_label(task_config.smart_sfx_strength)}，"
-                    f"已规划 {len(smart_sfx_events)} 个结构音效。"
+                    f"已规划 {len(smart_sfx_events)} 个结构音效；"
+                    f"来源：{smart_sfx_origin_summary(smart_sfx_events)}。"
                 )
             except Exception as exc:
                 self.log_signal.emit(
@@ -3853,6 +4297,16 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
                     f"剩余 {len(jobs)} 条继续执行。"
                 )
 
+        # 公平轮转：每个队列任务每轮最多产出 fair_quota 条后让位其它任务
+        # （未执行部分靠断点续传在下次轮转回来时继续，不重复不丢失）。
+        fair_quota = max(0, int(getattr(task_config, "fair_quota", 0) or 0))
+        if fair_quota > 0 and len(jobs) > fair_quota:
+            self.log_signal.emit(
+                f"[公平轮转] 本任务本轮先执行 {fair_quota} 条后让位，"
+                f"剩余 {len(jobs) - fair_quota} 条将在后续轮转继续。"
+            )
+            jobs = jobs[:fair_quota]
+
         if ai_intro_mode:
             usage = {}
             for job_audio, _ in jobs:
@@ -3864,12 +4318,31 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
                 f"{len(ai_intro_videos)} 条AI视频按均衡随机循环分配：{usage_text}"
             )
 
-        max_workers = max(1, min(int(task_config.threads or 1), len(jobs) or 1))
-        if task_config.strong_structure and max_workers > 2:
-            max_workers = 2
-            self.log_signal.emit(
-                "[稳定模式] 强结构混剪已限制为 2 路并发，在速度和长任务内存占用之间保持平衡。"
+        concurrency_sources = list(videos)
+        for collection in (
+            audios,
+            self.task.first_track_videos,
+            self.task.hook_videos,
+            self.task.second_segment_videos,
+            self.task.ai_intro_videos,
+        ):
+            concurrency_sources.extend(
+                str(item.get("path") or "")
+                for item in collection
+                if isinstance(item, dict)
             )
+        decision = choose_render_concurrency(
+            task_config.threads,
+            task_config.gpu_mode,
+            cache_dir,
+            concurrency_sources,
+            auto_enabled=task_config.auto_performance,
+            fast_render_enabled=task_config.fast_render_enabled,
+        )
+        max_workers = max(1, min(decision.workers, len(jobs) or 1))
+        self.log_signal.emit(
+            f"[自动并发] 本轮使用 {max_workers} 路并发；{decision.reason}。"
+        )
         if max_workers == 1:
             self.log_signal.emit(f"[引擎管线] 共需执行 {len(jobs)} 条任务，使用稳定单线程队列...\n")
             for audio_dict, round_idx in jobs:

@@ -14,6 +14,7 @@ from PyQt5.QtWidgets import (
     QMenu,
     QMessageBox,
     QPushButton,
+    QSpinBox,
     QToolButton,
     QVBoxLayout,
 )
@@ -28,6 +29,7 @@ from services.batch_project_service import (
     FAILED_STATUS,
     RUNNING_STATUS,
     STOPPED_STATUS,
+    WAITING_STATUS,
     project_display_name,
     queue_task_display_name,
     safe_output_component,
@@ -37,6 +39,7 @@ from services.render_checkpoint_service import (
     checkpoint_progress,
 )
 from services.platform_service import open_path, resolve_network_path
+from modules.batch_mixer.daily_automation_mixin import DailyAutomationMixin
 
 
 PROJECT_MEDIA_TABS = (
@@ -59,7 +62,7 @@ MODE_LABELS = {
 }
 
 
-class ProjectQueueMixin:
+class ProjectQueueMixin(DailyAutomationMixin):
     def init_batch_project_state(self):
         self.batch_project_repo = BatchProjectRepository()
         self._project_switch_guard = False
@@ -72,6 +75,12 @@ class ProjectQueueMixin:
         self._queue_stop_requested = False
         self._last_queue_persist_at = 0.0
         self._task_center_dialog = None
+        # 公平轮转（多店铺大批量互不饿死）状态
+        self._active_queue_fair = False
+        self._active_queue_product = ""
+        self._last_was_fair_yield = False
+        self._last_fair_product = ""
+        self._init_daily_automation()
 
     def build_batch_project_bar(self):
         frame = QFrame()
@@ -125,11 +134,30 @@ class ProjectQueueMixin:
         selector_layout.addWidget(label)
         selector_layout.addWidget(self.batch_project_combo, 1)
         selector_layout.addWidget(self.batch_project_status_label)
+        daily_btn = QPushButton("每日自动任务")
+        daily_btn.clicked.connect(self.show_daily_plans)
+        selector_layout.addWidget(daily_btn)
         action_layout.addWidget(new_btn)
         action_layout.addWidget(self.save_batch_project_btn)
         action_layout.addWidget(action_btn)
         action_layout.addWidget(QLabel("队列任务名:"))
         action_layout.addWidget(self.batch_task_name_input)
+        # 公平轮转：每个任务每轮产出上限（条），到量后让位给其它店铺的任务
+        self.batch_fair_quota_spin = QSpinBox()
+        self.batch_fair_quota_spin.setRange(0, 2000)
+        self.batch_fair_quota_spin.setValue(200)
+        self.batch_fair_quota_spin.setSingleStep(50)
+        self.batch_fair_quota_spin.setSuffix(" 条")
+        self.batch_fair_quota_spin.setFixedWidth(86)
+        self.batch_fair_quota_spin.setToolTip(
+            "公平轮转（多个店铺混排时防饿死）：\n"
+            "每个队列任务每轮最多产出这么多条，达到后自动让位给下一个店铺的任务，"
+            "未完成部分靠断点续传在后续轮转里继续。\n"
+            "0 = 关闭公平轮转（一个任务一口气跑完，与以前一样）。\n"
+            "建议：同时排多个店铺任务时开启，如每批 200 条，各店交替出片。"
+        )
+        self.batch_fair_quota_spin.wheelEvent = lambda event: event.ignore()
+        action_layout.addWidget(self.batch_fair_quota_spin)
         action_layout.addStretch(1)
         action_layout.addWidget(self.cancel_batch_queue_edit_btn)
         action_layout.addWidget(self.add_batch_queue_btn)
@@ -146,6 +174,7 @@ class ProjectQueueMixin:
             self._set_batch_project_combo(project_id)
             self._apply_batch_project(project, refresh=False)
         self._update_batch_project_bar()
+        self._start_daily_automation()
 
     def _reload_batch_project_combo(self):
         if not hasattr(self, "batch_project_combo"):
@@ -199,7 +228,7 @@ class ProjectQueueMixin:
             table = self.tables.get(tab)
             checkbox = self.select_all_cbx.get(tab)
             paths = []
-            if table is not None:
+            if table is not None and not (checkbox and checkbox.isChecked()):
                 for row in range(table.rowCount()):
                     if not self._asset_row_checked(table, row):
                         continue
@@ -255,6 +284,7 @@ class ProjectQueueMixin:
             "threads": self.thread_spin.value(),
             "anti_dedup": self.anti_dedup_chk.isChecked(),
             "auto_perf": self.auto_perf_chk.isChecked(),
+            "param_jitter": round(self.param_jitter_spin.value() / 100.0, 3),
         }
         project["subtitle"] = {
             "enable": self.sub_enable_chk.isChecked(),
@@ -266,6 +296,8 @@ class ProjectQueueMixin:
             "border_color": self.sub_border_color.currentText(),
             "anim": self.sub_anim.currentText(),
             "margin_v": self.sub_margin_v.value(),
+            "shadow": int(getattr(self, '_current_sub_style_preset', {}).get('shadow', 0) or 0),
+            "bold": -1 if getattr(self, '_current_sub_style_preset', {}).get('bold', True) else 0,
         }
         project["cover"] = {
             "text": self.cover_text_input.text(),
@@ -475,6 +507,9 @@ class ProjectQueueMixin:
             ("anti_dedup", self.anti_dedup_chk, "checked"),
             ("auto_perf", self.auto_perf_chk, "checked"),
         )
+        # 参数防重抖动：存的是 0~0.4 的比例，UI 显示的是 0~40 的百分比
+        if "param_jitter" in rules:
+            self.param_jitter_spin.setValue(int(round(float(rules.get("param_jitter") or 0.0) * 100)))
         for key, widget, kind in value_widgets:
             if key not in rules:
                 continue
@@ -501,6 +536,10 @@ class ProjectQueueMixin:
 
         subtitle = project.get("subtitle", {})
         if isinstance(subtitle, dict):
+            self._current_sub_style_preset = dict(
+                getattr(self, '_current_sub_style_preset', {}),
+                shadow=subtitle.get("shadow", 0), bold=bool(subtitle.get("bold", -1)),
+            )
             subtitle_values = (
                 ("enable", self.sub_enable_chk, "checked"),
                 ("word_timestamps", self.sub_word_timestamps_chk, "checked"),
@@ -554,7 +593,7 @@ class ProjectQueueMixin:
                 self.refresh_directory_async(tab, silent=True)
 
     def on_project_directory_populated(self, tab_name):
-        selection = self._pending_project_asset_selections.get(tab_name, {})
+        selection = self._pending_project_asset_selections.pop(tab_name, {})
         table = self.tables.get(tab_name)
         if table is not None and not selection.get("select_all", True):
             selected_paths = {
@@ -674,7 +713,7 @@ class ProjectQueueMixin:
             "message": "等待执行",
         }
 
-    def add_current_project_to_queue(self):
+    def add_current_project_to_queue(self, assets_refreshed=False):
         project = self.current_batch_project()
         if not project:
             QMessageBox.information(
@@ -689,6 +728,9 @@ class ProjectQueueMixin:
                 "素材仍在读取",
                 "切换项目后素材目录正在后台读取，读取完成后即可加入队列。",
             )
+            return
+        if not assets_refreshed:
+            self.request_task_asset_refresh(lambda: self.add_current_project_to_queue(assets_refreshed=True))
             return
         project = self.save_current_batch_project(silent=True) or project
         prepared = self.prepare_synthesis_task(
@@ -710,6 +752,16 @@ class ProjectQueueMixin:
                 "队列里已经有同名任务，请换一个便于区分的名称。",
             )
             return
+        # 公平轮转：单任务每轮产出配额（expected 大于配额才有意义）
+        fair_quota = (
+            self.batch_fair_quota_spin.value()
+            if hasattr(self, "batch_fair_quota_spin")
+            else 0
+        )
+        if fair_quota > 0 and expected > fair_quota:
+            task_data["fair_quota"] = int(fair_quota)
+        else:
+            task_data["fair_quota"] = 0
         payload = self._build_queue_task_payload(
             project,
             task_data,
@@ -809,6 +861,7 @@ class ProjectQueueMixin:
             "loop_count",
             "threads",
             "anti_dedup",
+            "param_jitter",
         ):
             if key in task_data:
                 rules[key] = copy.deepcopy(task_data.get(key))
@@ -859,6 +912,7 @@ class ProjectQueueMixin:
                 "运行中的任务参数已经交给后台线程，结束或停止后才能修改。",
             )
             return False
+        self.batch_project_repo.suspend_daily(True)
         if self._queue_auto_run:
             self._queue_auto_run = False
             self.batch_project_repo.set_queue_paused(True)
@@ -941,6 +995,7 @@ class ProjectQueueMixin:
         self.update_log("[任务队列] 已启动，将按顺序连续执行所有等待任务。")
 
     def pause_batch_task_queue(self):
+        self.batch_project_repo.suspend_daily(True)
         self._queue_auto_run = False
         self.batch_project_repo.set_queue_paused(True)
         if self._active_queue_task_id:
@@ -950,6 +1005,7 @@ class ProjectQueueMixin:
         self._refresh_task_center()
 
     def stop_current_queue_task(self):
+        self.batch_project_repo.suspend_daily(True)
         if not self._active_queue_task_id:
             self.pause_batch_task_queue()
             return
@@ -997,10 +1053,32 @@ class ProjectQueueMixin:
                 "楷体": "C:/Windows/Fonts/simkai.ttf",
             }
 
+    @staticmethod
+    def _queue_task_product(task):
+        shop = str((task or {}).get("shop_name") or "").strip()
+        product = str((task or {}).get("product_name") or "").strip()
+        return f"{shop}｜{product}"
+
     def _start_next_batch_queue_task(self):
         if not self._queue_auto_run or self._active_queue_task_id:
             return
-        queue_task = self.batch_project_repo.next_waiting_task()
+        if getattr(self, "_last_was_fair_yield", False):
+            # 公平轮转：上一任务让位后，优先启动不同店铺/产品的等待任务
+            excluded = getattr(self, "_last_fair_product", "")
+            # 必须取完整任务（含 task_data），摘要仅用于筛选后再取完整副本
+            queue_task = None
+            for task in self.batch_project_repo.tasks(include_payload=True):
+                if (
+                    task.get("status") == WAITING_STATUS
+                    and self._queue_task_product(task) != excluded
+                ):
+                    queue_task = task
+                    break
+            if queue_task is None:
+                queue_task = self.batch_project_repo.next_waiting_task()
+            self._last_was_fair_yield = False
+        else:
+            queue_task = self.batch_project_repo.next_waiting_task()
         if not queue_task:
             self._queue_auto_run = False
             self.batch_project_repo.set_queue_paused(True)
@@ -1075,7 +1153,13 @@ class ProjectQueueMixin:
             int(expected_from_checkpoint or 0),
         )
         self._active_queue_task_id = task_id
+        self._active_queue_completed_before = completed_before_start
         self._queue_stop_requested = False
+        # 公平轮转状态记录
+        self._active_queue_fair = (
+            max(0, int((task_data.get("fair_quota") or 0))) > 0
+        )
+        self._active_queue_product = self._queue_task_product(queue_task)
         self.batch_project_repo.update_task(
             task_id,
             status=RUNNING_STATUS,
@@ -1147,9 +1231,27 @@ class ProjectQueueMixin:
         task_id = self._active_queue_task_id
         if not task_id:
             return False
+        fair = bool(getattr(self, "_active_queue_fair", False))
+        product = str(getattr(self, "_active_queue_product", "") or "")
+        self._active_queue_fair = False
+        self._active_queue_product = ""
         if self._queue_stop_requested:
             status = STOPPED_STATUS
             message = f"已停止，保留已完成 {completed}/{expected} 条"
+        elif fair and completed < expected and completed <= getattr(self, "_active_queue_completed_before", 0):
+            status = FAILED_STATUS
+            message = f"本轮没有新增成片，已暂停重试，保留断点 {completed}/{expected}；请检查任务日志"
+            self.update_log(f"[任务队列] {message}")
+        elif fair and completed < expected and expected > 0:
+            # 公平轮转让位：本批完成但任务未做完 → 回等待，轮转其它店铺
+            status = WAITING_STATUS
+            message = f"本轮已产出 {completed}/{expected} 条，让位其它任务，稍后自动续跑"
+            self._last_was_fair_yield = True
+            self._last_fair_product = product
+            self.update_log(
+                f"[公平轮转] 任务已完成本批 {completed} 条，让位给其它店铺，"
+                f"剩余 {expected - completed} 条稍后自动续跑。"
+            )
         elif completed >= expected and expected > 0:
             status = COMPLETED_STATUS
             message = f"已完成 {completed}/{expected} 条"
@@ -1202,6 +1304,8 @@ class ProjectQueueMixin:
             open_path(output_dir)
 
     def prepare_batch_queue_close(self):
+        self.cancel_pending_asset_refresh()
+        self._close_daily_automation()
         self._queue_auto_run = False
         self.batch_project_repo.set_queue_paused(True)
         self.save_current_batch_project(silent=True)

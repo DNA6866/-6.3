@@ -241,7 +241,24 @@ class BatchProjectRepository:
                 self._save_state(self._state)
             return changed
 
-    def add_task(self, task):
+    def sync_project_selection(self, project_id, tab, expected_root, selection):
+        """仅同步素材选择，不能把尚未保存的参数或队列编辑写回模板。"""
+        with self._lock:
+            for project in self._state.get("projects", []):
+                if project.get("id") != project_id or project.get("directories", {}).get(tab) != expected_root:
+                    continue
+                selections = project.setdefault("asset_selections", {})
+                if selections.get(tab) != selection:
+                    previous = copy.deepcopy(selections)
+                    selections[tab] = copy.deepcopy(selection)
+                    try:
+                        self._save_state(self._state)
+                    except Exception:
+                        project["asset_selections"] = previous
+                        raise
+                return
+
+    def _prepare_task(self, task):
         data = copy.deepcopy(task if isinstance(task, dict) else {})
         data["id"] = str(data.get("id") or uuid.uuid4().hex)
         data["task_name"] = queue_task_display_name(data)
@@ -262,17 +279,76 @@ class BatchProjectRepository:
         data["completed"] = 0
         data.setdefault("expected", 0)
         data.setdefault("message", "等待执行")
+        return data
+
+    def _trim_completed_history(self):
+        # 只裁减已完成历史，等待、失败及中断任务必须保留断点。
+        tasks = self._state.get("tasks", [])
+        completed = [t for t in tasks if t.get("status") == COMPLETED_STATUS]
+        obsolete = {t.get("id") for t in completed[:-200]}
+        self._state["tasks"] = [t for t in tasks if t.get("id") not in obsolete]
+
+    def add_task(self, task):
+        data = self._prepare_task(task)
         with self._lock:
             tasks = self._state.setdefault("tasks", [])
             tasks.append(data)
-            removed_tasks = tasks[:-200]
-            self._state["tasks"] = tasks[-200:]
+            self._trim_completed_history()
             self._save_state(self._state)
-            for removed_task in removed_tasks:
-                remove_checkpoint(
-                    str(removed_task.get("checkpoint_path") or "")
-                )
         return copy.deepcopy(data)
+
+    def daily_state(self):
+        with self._lock:
+            return copy.deepcopy(self._state.get("daily", {
+                "plans": [], "runs": {}, "suspended": False,
+            }))
+
+    def save_daily_plan(self, plan):
+        data = copy.deepcopy(plan)
+        data["id"] = str(data.get("id") or uuid.uuid4().hex)
+        data["revision"] = uuid.uuid4().hex
+        with self._lock:
+            daily = self._state.setdefault("daily", {})
+            plans = daily.setdefault("plans", [])
+            plans[:] = [p for p in plans if p.get("id") != data["id"]] + [data]
+            self._save_state(self._state)
+        return copy.deepcopy(data)
+
+    def delete_daily_plan(self, plan_id):
+        with self._lock:
+            daily = self._state.setdefault("daily", {})
+            daily["plans"] = [p for p in daily.get("plans", []) if p.get("id") != plan_id]
+            self._save_state(self._state)
+
+    def suspend_daily(self, suspended):
+        with self._lock:
+            self._state.setdefault("daily", {})["suspended"] = bool(suspended)
+            self._save_state(self._state)
+
+    def add_daily_batch(self, plan, day, payloads, hooks):
+        """任务、当日去重记录及钩子使用记录在同一次持久化中提交。"""
+        key = f"{plan.get('id')}:{day}"
+        with self._lock:
+            daily = self._state.setdefault("daily", {})
+            current = next((p for p in daily.get("plans", []) if p.get("id") == plan.get("id")), {})
+            if (daily.get("suspended") or not current.get("enabled")
+                    or current.get("revision") != plan.get("revision")
+                    or key in daily.get("runs", {})):
+                return []
+            old_state = copy.deepcopy(self._state)
+            tasks = [self._prepare_task(p) for p in payloads]
+            try:
+                self._state.setdefault("tasks", []).extend(tasks)
+                daily.setdefault("runs", {})[key] = {
+                    "day": day, "task_ids": [t.get("id") for t in tasks],
+                    "hooks": hooks, "expected": sum(t.get("expected", 0) for t in tasks),
+                }
+                self._trim_completed_history()
+                self._save_state(self._state)
+            except Exception:
+                self._state = old_state
+                raise
+            return copy.deepcopy(tasks)
 
     def replace_task(self, task_id, replacement):
         """原位替换可编辑任务，并清空与旧参数不兼容的断点。"""

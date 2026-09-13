@@ -13,6 +13,7 @@ from PyQt5.QtCore import QThread, pyqtSignal
 from services.smart_sfx_service import (
     build_sfx_mix_filters,
     plan_smart_sfx,
+    smart_sfx_origin_summary,
     smart_sfx_strength_label,
 )
 from utils import TRANS_MAP
@@ -1267,7 +1268,12 @@ class ReplacementRenderWorker(QThread):
             smart_sfx_candidates = []
             if has_intro:
                 smart_sfx_candidates.append(
-                    {"time": 0.0, "kind": "intro", "priority": 3}
+                    {
+                        "time": 0.0,
+                        "kind": "intro",
+                        "priority": 3,
+                        "style": "cinematic",
+                    }
                 )
             for slot_plan in job.get("slot_plans") or []:
                 smart_sfx_candidates.append({
@@ -1275,6 +1281,7 @@ class ReplacementRenderWorker(QThread):
                     + float(slot_plan.get("start") or 0.0),
                     "kind": "product",
                     "priority": 2,
+                    "style": "replacement",
                 })
             transition_mode = LEGACY_TRANSITION_MODES.get(
                 str(settings.get("transition_mode") or "none"),
@@ -1292,11 +1299,13 @@ class ReplacementRenderWorker(QThread):
                         + float(segment.get("start") or 0.0),
                         "kind": "transition",
                         "priority": 1,
+                        "style": transition_mode,
                     })
             smart_sfx_candidates.append({
                 "time": max(0.0, total_duration - 0.45),
                 "kind": "ending",
                 "priority": 2,
+                "style": "ending",
             })
             try:
                 smart_sfx_events = plan_smart_sfx(
@@ -1308,7 +1317,8 @@ class ReplacementRenderWorker(QThread):
                 )
                 self.log.emit(
                     f"智能音效已规划 {len(smart_sfx_events)} 个结构点，"
-                    f"档位：{smart_sfx_strength_label(settings.get('smart_sfx_strength'))}。"
+                    f"档位：{smart_sfx_strength_label(settings.get('smart_sfx_strength'))}；"
+                    f"来源：{smart_sfx_origin_summary(smart_sfx_events)}。"
                 )
             except Exception as exc:
                 self.log.emit(f"智能音效准备失败，本条自动按无音效继续：{exc}")
@@ -1527,6 +1537,18 @@ class ReplacementRenderWorker(QThread):
         if requires_audio and not info.get("has_audio"):
             raise RuntimeError("输出视频缺少音频")
 
+    @staticmethod
+    def _job_requires_audio(project, source_info, job):
+        intro_plan = dict(job.get("intro_plan") or {})
+        audio_plan = dict(job.get("audio_plan") or {})
+        settings = dict(project.get("settings") or {})
+        return bool(
+            intro_plan.get("path")
+            or audio_plan.get("path")
+            or source_info.get("has_audio")
+            or settings.get("smart_sfx_enabled", False)
+        )
+
     def run(self):
         try:
             if not os.path.isfile(self.ffmpeg_path) or not os.path.isfile(self.ffprobe_path):
@@ -1614,6 +1636,33 @@ class ReplacementRenderWorker(QThread):
             peak_cache.save()
 
             jobs = manifest.get("jobs") or []
+            repaired_resume = False
+            for job in jobs:
+                output_path = str(job.get("output") or "")
+                if job.get("status") != "completed" or not output_path:
+                    continue
+                try:
+                    self._verify_output(
+                        output_path,
+                        source_info,
+                        float(
+                            job.get("total_duration")
+                            or job.get("target_duration")
+                            or source_info.get("duration")
+                            or 0.0
+                        ),
+                        self._job_requires_audio(project, source_info, job),
+                    )
+                except (OSError, RuntimeError, TypeError, ValueError) as exc:
+                    job["status"] = "pending"
+                    job["error"] = f"恢复校验未通过：{exc}"
+                    repaired_resume = True
+                    self.log.emit(
+                        f"断点文件校验未通过，将重新生成第 "
+                        f"{int(job.get('index') or 0)} 个视频：{exc}"
+                    )
+            if repaired_resume:
+                self._save_manifest(manifest_path, manifest)
             self.jobs_prepared.emit(
                 [
                     {
@@ -1684,15 +1733,7 @@ class ReplacementRenderWorker(QThread):
                         or source_info.get("duration")
                         or 0.0
                     ),
-                    bool(
-                        intro_plan.get("path")
-                        or audio_plan.get("path")
-                        or source_info.get("has_audio")
-                        or (project.get("settings") or {}).get(
-                            "smart_sfx_enabled",
-                            False,
-                        )
-                    ),
+                    self._job_requires_audio(project, source_info, job),
                 )
                 used_paths = [
                     clip.get("path")

@@ -9,6 +9,16 @@ from array import array
 from PyQt5.QtCore import QThread, pyqtSignal
 
 from paths import logs_dir
+from services.job_resume_service import (
+    JobResumeStore,
+    source_identity,
+    stable_job_key,
+)
+from services.media_validation_service import (
+    atomic_media_path,
+    hidden_creation_flags,
+    validate_media_output,
+)
 
 
 VIDEO_EXTENSIONS = (
@@ -66,6 +76,9 @@ def probe_video(ffprobe_path, source):
         encoding="utf-8",
         errors="replace",
         startupinfo=hidden_startupinfo(),
+        creationflags=hidden_creation_flags(),
+        timeout=45,
+        check=False,
     )
     if result.returncode != 0:
         raise RuntimeError((result.stdout or "ffprobe 无法读取该视频").strip())
@@ -324,6 +337,34 @@ class ClipExportWorker(QThread):
         self._stop_requested = False
         self._process = None
         self.log_path = os.path.join(logs_dir(), "quick_video_trim_latest.log")
+        probe_name = "ffprobe.exe" if os.name == "nt" else "ffprobe"
+        self.ffprobe_path = os.path.join(os.path.dirname(ffmpeg_path), probe_name)
+
+    def _task_key(self, task):
+        return stable_job_key(
+            [
+                source_identity(str(task.get("source") or "")),
+                round(float(task.get("start") or 0.0), 6),
+                round(float(task.get("end") or 0.0), 6),
+                int(task.get("number") or 0),
+                self.mode,
+            ]
+        )
+
+    def _resume_store(self):
+        task_keys = [self._task_key(task) for task in self.tasks]
+        fingerprint = stable_job_key(
+            [
+                os.path.normcase(os.path.abspath(self.output_dir)),
+                self.mode,
+                task_keys,
+            ]
+        )
+        path = os.path.join(
+            logs_dir(),
+            f"quick_trim_resume_{fingerprint[:16]}.json",
+        )
+        return JobResumeStore(path, fingerprint)
 
     def cancel(self):
         self._stop_requested = True
@@ -355,7 +396,7 @@ class ClipExportWorker(QThread):
         stamp = time.strftime("%H%M%S")
         return os.path.join(
             self.output_dir,
-            f"{os.path.splitext(filename)[0]}_{stamp}.mp4",
+            f"{os.path.splitext(filename)[0]}_{stamp}_{time.time_ns() % 10000:04d}.mp4",
         )
 
     def _precise_video_args(self, level):
@@ -440,55 +481,157 @@ class ClipExportWorker(QThread):
         success = 0
         failed_count = 0
         total = len(self.tasks)
+        resume_store = self._resume_store()
         try:
             with open(self.log_path, "w", encoding="utf-8", errors="replace") as log:
                 log.write(f"视频快速剪辑导出日志 {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
                 for index, task in enumerate(self.tasks):
                     if self._stop_requested:
                         break
-                    output_path = self._output_path(task)
+                    task_key = self._task_key(task)
+                    resume_record = resume_store.job(task_key)
+                    output_path = str(resume_record.get("output") or "")
+                    if output_path:
+                        valid, _detail = validate_media_output(
+                            self.ffprobe_path,
+                            output_path,
+                            require_video=True,
+                            minimum_bytes=1024,
+                        )
+                        if valid:
+                            resume_store.update(
+                                task_key,
+                                "completed",
+                                output_path,
+                            )
+                            success += 1
+                            self.message.emit(
+                                f"断点续传：跳过已完成片段 {index + 1}/{total}"
+                            )
+                            self.file_finished.emit(output_path)
+                            self.progress.emit(
+                                int((index + 1) / max(1, total) * 100),
+                                index + 1,
+                                total,
+                            )
+                            continue
+                        resume_store.update(
+                            task_key,
+                            "pending",
+                            output_path,
+                            "原完成文件未通过校验，已重新导出",
+                        )
+                    if not output_path:
+                        output_path = self._output_path(task)
+                    resume_store.update(task_key, "running", output_path)
+                    partial_path = atomic_media_path(output_path)
                     duration = float(task["end"]) - float(task["start"])
                     self.message.emit(
                         f"正在导出 {index + 1}/{total}："
                         f"{os.path.basename(task['source'])} 高潮{task['number']:02d}"
                     )
-                    command = self._build_command(task, output_path)
+                    command = self._build_command(task, partial_path)
                     try:
                         self._run_command(command, duration, log, index, total)
                     except Exception as exc:
                         if self._stop_requested:
+                            resume_store.update(
+                                task_key,
+                                "pending",
+                                output_path,
+                                "任务中断，等待下次继续",
+                            )
+                            try:
+                                if os.path.isfile(partial_path):
+                                    os.remove(partial_path)
+                            except OSError:
+                                pass
                             break
                         if self.mode == "precise" and self.hardware_level in {"nvenc", "amf"}:
                             self.message.emit("硬件精准编码失败，正在自动切换 CPU 精准编码...")
                             try:
-                                if os.path.exists(output_path):
-                                    os.remove(output_path)
+                                if os.path.exists(partial_path):
+                                    os.remove(partial_path)
                             except OSError:
                                 pass
-                            command = self._build_command(task, output_path, level="cpu")
+                            command = self._build_command(task, partial_path, level="cpu")
                             try:
                                 self._run_command(command, duration, log, index, total)
                             except Exception as fallback_exc:
                                 failed_count += 1
+                                resume_store.update(
+                                    task_key,
+                                    "failed",
+                                    output_path,
+                                    str(fallback_exc),
+                                )
                                 self.message.emit(f"导出失败：{fallback_exc}")
+                                try:
+                                    if os.path.isfile(partial_path):
+                                        os.remove(partial_path)
+                                except OSError:
+                                    pass
                                 continue
                         else:
                             failed_count += 1
+                            resume_store.update(
+                                task_key,
+                                "failed",
+                                output_path,
+                                str(exc),
+                            )
                             self.message.emit(f"导出失败：{exc}")
+                            try:
+                                if os.path.isfile(partial_path):
+                                    os.remove(partial_path)
+                            except OSError:
+                                pass
                             continue
 
-                    if os.path.isfile(output_path) and os.path.getsize(output_path) > 1024:
+                    valid, detail = validate_media_output(
+                        self.ffprobe_path,
+                        partial_path,
+                        require_video=True,
+                        minimum_bytes=1024,
+                    )
+                    if valid:
+                        os.replace(partial_path, output_path)
                         success += 1
+                        resume_store.update(task_key, "completed", output_path)
                         self.file_finished.emit(output_path)
                     else:
                         failed_count += 1
-                        self.message.emit("导出结束但没有生成有效视频文件。")
+                        resume_store.update(
+                            task_key,
+                            "failed",
+                            output_path,
+                            detail,
+                        )
+                        self.message.emit(
+                            f"导出结束但文件未通过完整性校验：{detail}"
+                        )
+                        try:
+                            if os.path.isfile(partial_path):
+                                os.remove(partial_path)
+                        except OSError:
+                            pass
                 self.progress.emit(100 if not self._stop_requested else 0, total, total)
+            resume_store.finish(
+                not self._stop_requested
+                and failed_count == 0
+                and success == total
+            )
             self.finished.emit(success, failed_count, self.output_dir)
         except Exception as exc:
+            resume_store.finish(False)
             if self._stop_requested:
                 self.finished.emit(success, failed_count, self.output_dir)
             else:
                 self.failed.emit(f"{exc}\n完整日志：{self.log_path}")
         finally:
             self._process = None
+            try:
+                if "partial_path" in locals() and os.path.isfile(partial_path):
+                    os.remove(partial_path)
+            except OSError:
+                pass

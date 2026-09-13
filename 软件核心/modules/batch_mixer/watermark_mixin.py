@@ -10,7 +10,9 @@ from PyQt5.QtWidgets import (
     QComboBox,
     QDialog,
     QFormLayout,
+    QScrollArea,
     QFrame,
+    QGridLayout,
     QHBoxLayout,
     QHeaderView,
     QInputDialog,
@@ -149,6 +151,7 @@ class WatermarkMixin:
             'line_spacing': self._spinbox_live_value(self.wm_line_spacing) if hasattr(self, 'wm_line_spacing') else 130,
             'letter_spacing': self._spinbox_live_value(self.wm_letter_spacing) if hasattr(self, 'wm_letter_spacing') else 0,
             'border_w': self._spinbox_live_value(self.wm_border_w), 'border_color': self.wm_border_color.currentText(), 'is_bold': self.wm_is_bold.isChecked(),
+            'shadow': int(getattr(self, '_current_wm_style_preset', {}).get('shadow', 0) or 0),
             'x': self._spinbox_live_value(self.wm_x), 'y': self._spinbox_live_value(self.wm_y), 'anim': self.wm_anim.currentText()
         }
 
@@ -246,6 +249,10 @@ class WatermarkMixin:
 
     def set_watermark_canvas_size(self, canvas, popup=False):
         design_w, design_h = self.current_watermark_design_size()
+        # 底图比例自适应：画布比例 = 底图比例，位置所见即所得
+        design_w, design_h = self._preview_design_size_with_bg(
+            design_w, design_h, getattr(self, 'preview_bg_path', '')
+        )
         if popup and design_h >= design_w:
             canvas_w = 520 if popup else 260
             canvas_h = int(canvas_w * design_h / design_w)
@@ -261,8 +268,14 @@ class WatermarkMixin:
                 min_w=190 if design_h >= design_w else 260,
                 reserved_h=70,
                 reserved_w=20,
-                host_widget=canvas.parentWidget(),
+                # host_widget 传 None：画布尺寸只随主窗口，不随滚动容器
+                # （画布包进 QScrollArea 后 parent 是 scroll，其尺寸又绑定画布，
+                #   会形成"画布→scroll→画布"收缩循环，每点一次预览缩小一次）。
+                host_widget=None,
             )
+            # 预览缩放：放大查看细节（不影响成片，仅预览显示）
+            zoom = self._preview_zoom_factor()
+            canvas_w, canvas_h = max(1, int(canvas_w * zoom)), max(1, int(canvas_h * zoom))
         canvas.setFixedSize(canvas_w, canvas_h)
         if hasattr(canvas, 'set_design_size'):
             canvas.set_design_size(design_w, design_h)
@@ -273,6 +286,8 @@ class WatermarkMixin:
             child.setParent(None)
             child.deleteLater()
         design_w, design_h = self.set_watermark_canvas_size(canvas, popup=getattr(canvas, 'is_popup_preview', False))
+        if not getattr(canvas, 'is_popup_preview', False):
+            self._sync_preview_scroll_size(getattr(self, 'preview_scroll', None), canvas)
         scale_ratio = canvas.width() / design_w
         if self.preview_bg_path and os.path.exists(self.preview_bg_path):
             bg_lbl = QLabel(canvas); bg_lbl.setGeometry(0, 0, canvas.width(), canvas.height())
@@ -575,6 +590,25 @@ class WatermarkMixin:
         self.wm_anim.setMinimumWidth(160)
         self.wm_anim.setMaximumWidth(240)
         
+        # 花字预设选择器（水印/卖点随机词共用）
+        wm_preset_cell = QWidget()
+        wm_preset_cell_layout = QVBoxLayout(wm_preset_cell)
+        wm_preset_cell_layout.setContentsMargins(0, 0, 0, 0)
+        wm_preset_cell_layout.setSpacing(4)
+        wm_preset_top = QHBoxLayout()
+        wm_preset_top.addStretch()
+        self.wm_style_random_btn = QPushButton("🎲 随机")
+        self.wm_style_random_btn.setFixedWidth(70)
+        self.wm_style_random_btn.setStyleSheet(
+            "QPushButton{background:#1E3A5F;border:1px solid #3B82F6;border-radius:6px;"
+            "color:#F8FAFC;font-weight:700;padding:4px 6px;}"
+            "QPushButton:hover{background:#1E40AF;}"
+        )
+        self.wm_style_random_btn.clicked.connect(self._apply_wm_random_style)
+        wm_preset_top.addWidget(self.wm_style_random_btn)
+        wm_preset_cell_layout.addLayout(wm_preset_top)
+        wm_preset_cell_layout.addWidget(self._build_wm_style_presets())
+        form.addRow("花字预设:", wm_preset_cell)
         form.addRow(self.mode_label)
         form.addRow("固定文字:", input_layout)
         font_layout = QHBoxLayout()
@@ -669,7 +703,16 @@ class WatermarkMixin:
         big_preview_btn = QPushButton("大图"); big_preview_btn.clicked.connect(self.open_watermark_big_preview)
         self._style_preview_action_buttons(load_bg_btn, video_frame_btn, big_preview_btn)
         bg_btn_layout.addStretch(); bg_btn_layout.addWidget(load_bg_btn); bg_btn_layout.addWidget(video_frame_btn); bg_btn_layout.addWidget(big_preview_btn); bg_btn_layout.addStretch(); right_v.addLayout(bg_btn_layout)
-        self.preview_canvas = DragPreviewCanvas(); self.preview_canvas.setObjectName("referencePreview"); self.preview_canvas.setAttribute(Qt.WA_StyledBackground, True); self.preview_canvas.setStyleSheet("background-color: #020617; border: 2px solid #38BDF8; border-radius: 8px;"); self.set_watermark_canvas_size(self.preview_canvas); self.preview_canvas.pointChanged.connect(self.set_watermark_position_from_preview); right_v.addWidget(self.preview_canvas, alignment=Qt.AlignHCenter | Qt.AlignTop); right_v.addStretch()
+        right_v.addLayout(self._make_preview_zoom_spin(self.draw_preview_canvas))
+        self.preview_canvas = DragPreviewCanvas(); self.preview_canvas.setObjectName("referencePreview"); self.preview_canvas.setAttribute(Qt.WA_StyledBackground, True); self.preview_canvas.setStyleSheet("background-color: #020617; border: 2px solid #38BDF8; border-radius: 8px;"); self.set_watermark_canvas_size(self.preview_canvas);         self.preview_canvas.pointChanged.connect(self.set_watermark_position_from_preview)
+        self.preview_scroll = QScrollArea()
+        self.preview_scroll.setWidgetResizable(False)
+        self.preview_scroll.setFrameShape(QFrame.NoFrame)
+        self.preview_scroll.setAlignment(Qt.AlignHCenter | Qt.AlignTop)
+        self.preview_scroll.setStyleSheet("QScrollArea{background:transparent;border:none;}")
+        self.preview_scroll.setWidget(self.preview_canvas)
+        self._sync_preview_scroll_size(self.preview_scroll, self.preview_canvas)
+        right_v.addWidget(self.preview_scroll, alignment=Qt.AlignHCenter | Qt.AlignTop); right_v.addStretch()
         layout.addWidget(preview_group, stretch=0)
         
         self.wm_size.setKeyboardTracking(True)
@@ -690,4 +733,101 @@ class WatermarkMixin:
         for spinbox in (self.wm_size, self.wm_line_spacing, self.wm_letter_spacing, self.wm_border_w, self.wm_x, self.wm_y):
             spinbox.lineEdit().textChanged.connect(self.schedule_watermark_preview_update)
         return tab
+
+    def _build_wm_style_presets(self):
+        """花字预设选择器（水印/卖点随机词共用），大预览格直接显示渲染效果。"""
+        from PyQt5.QtCore import QSize
+        from PyQt5.QtGui import QIcon
+        from services.subtitle_presets import SUB_STYLES, render_style_swatch
+
+        container = QWidget()
+        grid = QGridLayout(container)
+        grid.setContentsMargins(0, 0, 0, 0)
+        grid.setSpacing(6)
+        self.wm_style_buttons = []
+        cols = 3
+        for idx, preset in enumerate(SUB_STYLES):
+            btn = QPushButton()
+            btn.setCheckable(True)
+            btn.setToolTip(preset["name"])
+            btn.setFixedSize(104, 46)
+            swatch = render_style_swatch(preset)
+            if swatch:
+                btn.setIcon(QIcon(swatch))
+                btn.setIconSize(QSize(100, 42))
+            btn.setStyleSheet(
+                "QPushButton{background:#1E293B;border:1px solid #475569;border-radius:6px;padding:0;}"
+                "QPushButton:hover{border:2px solid #60A5FA;}"
+                "QPushButton:checked{border:3px solid #FACC15;background:#1E3A5F;}"
+            )
+            btn.clicked.connect(lambda checked=False, p=preset, b=btn: self._apply_wm_style_preset(p, b))
+            grid.addWidget(btn, idx // cols, idx % cols)
+            self.wm_style_buttons.append(btn)
+        container.setLayout(grid)
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        scroll.setFixedHeight(150)
+        scroll.setStyleSheet("QScrollArea{background:transparent;border:none;}")
+        scroll.setWidget(container)
+        return scroll
+
+    def _apply_wm_style_preset(self, preset, clicked_btn):
+        """点选花字预设：应用到水印表单，并联动预览。"""
+        for btn in self.wm_style_buttons:
+            btn.setChecked(btn is clicked_btn)
+        self.wm_font.blockSignals(True)
+        if preset.get("font"):
+            idx = self.wm_font.findText(preset["font"])
+            if idx >= 0:
+                self.wm_font.setCurrentIndex(idx)
+        self.wm_font.blockSignals(False)
+        self.wm_size.blockSignals(True); self.wm_size.setValue(int(preset.get("size", 60))); self.wm_size.blockSignals(False)
+        self.wm_color.blockSignals(True)
+        cidx = self.wm_color.findText(preset.get("color", "white"))
+        if cidx >= 0:
+            self.wm_color.setCurrentIndex(cidx)
+        self.wm_color.blockSignals(False)
+        self.wm_border_color.blockSignals(True)
+        bidx = self.wm_border_color.findText(preset.get("border_color", "black"))
+        if bidx >= 0:
+            self.wm_border_color.setCurrentIndex(bidx)
+        self.wm_border_color.blockSignals(False)
+        self.wm_border_w.blockSignals(True); self.wm_border_w.setValue(int(preset.get("border_w", 2))); self.wm_border_w.blockSignals(False)
+        # 粗体
+        self.wm_is_bold.blockSignals(True)
+        self.wm_is_bold.setChecked(bool(preset.get("bold", True)))
+        self.wm_is_bold.blockSignals(False)
+        # 记录预设（shadow 用于引擎 ASS 生成）
+        self._current_wm_style_preset = preset
+        self.draw_preview_canvas()
+
+    def _apply_wm_random_style(self):
+        """随机花字：只换颜色搭配（主色+描边色），保留字号/描边粗细/边距/粗体。"""
+        from services.subtitle_presets import random_style
+        preset = random_style()
+        if not preset:
+            return
+        from services.subtitle_presets import color_to_combo_item
+        self.wm_color.blockSignals(True)
+        cidx = color_to_combo_item(preset.get("color", "#FFFFFF"), self.wm_color)
+        if cidx is not None:
+            self.wm_color.setCurrentIndex(cidx)
+        self.wm_color.blockSignals(False)
+        self.wm_border_color.blockSignals(True)
+        bidx = color_to_combo_item(preset.get("border_color", "#000000"), self.wm_border_color)
+        if bidx is not None:
+            self.wm_border_color.setCurrentIndex(bidx)
+        self.wm_border_color.blockSignals(False)
+        current = dict(getattr(self, "_current_wm_style_preset", {}) or {})
+        current["color"] = str(preset.get("color", "#FFFFFF"))
+        current["border_color"] = str(preset.get("border_color", "#000000"))
+        self._current_wm_style_preset = current
+        for btn in self.wm_style_buttons:
+            btn.setChecked(False)
+        self.draw_preview_canvas()
+        self.update_log(f"[花字] 随机颜色搭配：{preset['name']}")
 

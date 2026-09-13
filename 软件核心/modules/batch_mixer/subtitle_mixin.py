@@ -10,6 +10,7 @@ from PyQt5.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QLineEdit,
+    QScrollArea,
     QPushButton,
     QScrollArea,
     QSizePolicy,
@@ -39,9 +40,21 @@ class SubtitleMixin:
         left_v.addWidget(info_label)
 
         # 花字预设选择器（大预览格，直接显示渲染效果）
-        preset_label = QLabel("花字预设（点选即应用，下方实时预览）")
+        preset_row = QHBoxLayout()
+        preset_label = QLabel("花字预设")
         preset_label.setObjectName("appSubtitle")
-        left_v.addWidget(preset_label)
+        self.sub_style_random_btn = QPushButton("🎲 随机")
+        self.sub_style_random_btn.setFixedWidth(70)
+        self.sub_style_random_btn.setStyleSheet(
+            "QPushButton{background:#1E3A5F;border:1px solid #3B82F6;border-radius:6px;"
+            "color:#F8FAFC;font-weight:700;padding:4px 6px;}"
+            "QPushButton:hover{background:#1E40AF;}"
+        )
+        self.sub_style_random_btn.clicked.connect(self._apply_random_sub_style)
+        preset_row.addWidget(preset_label)
+        preset_row.addStretch()
+        preset_row.addWidget(self.sub_style_random_btn)
+        left_v.addLayout(preset_row)
         self.sub_style_buttons = []
         self.sub_style_scroll = QScrollArea()
         self.sub_style_scroll.setWidgetResizable(True)
@@ -167,13 +180,22 @@ class SubtitleMixin:
         bg_btn_layout.addWidget(load_bg_btn)
         bg_btn_layout.addWidget(video_frame_btn)
         bg_btn_layout.addStretch()
+        zoom_row = self._make_preview_zoom_spin(self.draw_subtitle_preview)
+        right_v.addLayout(zoom_row)
         right_v.addLayout(bg_btn_layout)
         self.sub_preview_canvas = QWidget()
         self.sub_preview_canvas.setObjectName("referencePreview")
         self.sub_preview_canvas.setAttribute(Qt.WA_StyledBackground, True)
         self.sub_preview_canvas.setStyleSheet("background-color:#111; border:2px solid #38BDF8; border-radius:8px;")
         self.sub_preview_canvas.setFixedSize(*self._subtitle_preview_size())
-        right_v.addWidget(self.sub_preview_canvas, alignment=Qt.AlignHCenter | Qt.AlignTop)
+        self.sub_preview_scroll = QScrollArea()
+        self.sub_preview_scroll.setWidgetResizable(False)
+        self.sub_preview_scroll.setFrameShape(QFrame.NoFrame)
+        self.sub_preview_scroll.setAlignment(Qt.AlignHCenter | Qt.AlignTop)
+        self.sub_preview_scroll.setStyleSheet("QScrollArea{background:transparent;border:none;}")
+        self.sub_preview_scroll.setWidget(self.sub_preview_canvas)
+        self._sync_preview_scroll_size(self.sub_preview_scroll, self.sub_preview_canvas)
+        right_v.addWidget(self.sub_preview_scroll, alignment=Qt.AlignHCenter | Qt.AlignTop)
         right_v.addStretch()
         layout.addWidget(preview_group, stretch=1)
         
@@ -215,12 +237,58 @@ class SubtitleMixin:
         self._current_sub_style_preset = preset
         self.draw_subtitle_preview()
 
+    def _apply_random_sub_style(self):
+        """随机花字：只换颜色搭配（主色+描边色），保留字号/描边粗细/边距/粗体。"""
+        from services.subtitle_presets import random_style
+        preset = random_style()
+        if not preset:
+            return
+        # 只更新颜色搭配（用映射函数兼容 hex/色名）
+        from services.subtitle_presets import color_to_combo_item
+        self.sub_color.blockSignals(True)
+        cidx = color_to_combo_item(preset.get("color", "#FFFFFF"), self.sub_color)
+        if cidx is not None:
+            self.sub_color.setCurrentIndex(cidx)
+        self.sub_color.blockSignals(False)
+        self.sub_border_color.blockSignals(True)
+        bidx = color_to_combo_item(preset.get("border_color", "#000000"), self.sub_border_color)
+        if bidx is not None:
+            self.sub_border_color.setCurrentIndex(bidx)
+        self.sub_border_color.blockSignals(False)
+        # 记录当前预设（仅颜色字段生效，字号/描边等保留用户设置）
+        current = dict(getattr(self, "_current_sub_style_preset", {}) or {})
+        current["color"] = str(preset.get("color", "#FFFFFF"))
+        current["border_color"] = str(preset.get("border_color", "#000000"))
+        self._current_sub_style_preset = current
+        # 不高亮任何预设格（当前是混合参数）
+        for btn in self.sub_style_buttons:
+            btn.setChecked(False)
+        self.draw_subtitle_preview()
+        self.update_log(f"[花字] 随机颜色搭配：{preset['name']}")
+
     def _subtitle_preview_size(self):
         res_combo = getattr(self, 'res_combo', None)
         res_text = res_combo.currentText() if res_combo else self.RES_PORTRAIT
         if "竖屏" in res_text:
-            return self._fit_preview_canvas_size(1080, 1920, max_w=430, max_h=760, min_w=190, reserved_h=70, reserved_w=20, host_widget=self.sub_preview_canvas.parentWidget() if hasattr(self, 'sub_preview_canvas') else None)
-        return self._fit_preview_canvas_size(1920, 1080, max_w=430, max_h=242, min_w=260, reserved_h=70, reserved_w=20, host_widget=self.sub_preview_canvas.parentWidget() if hasattr(self, 'sub_preview_canvas') else None)
+            design_w, design_h = 1080, 1920
+            max_w, max_h, min_w = 430, 760, 190
+        else:
+            design_w, design_h = 1920, 1080
+            max_w, max_h, min_w = 430, 242, 260
+        # 底图比例自适应：画布比例 = 底图比例，位置所见即所得
+        design_w, design_h = self._preview_design_size_with_bg(
+            design_w, design_h, getattr(self, 'sub_preview_bg_path', '')
+        )
+        base_w, base_h = self._fit_preview_canvas_size(
+            design_w, design_h, max_w=max_w, max_h=max_h, min_w=min_w,
+            reserved_h=70, reserved_w=20,
+            # 不随滚动容器自适应（画布包进 QScrollArea 后其尺寸绑定画布，
+            # 会形成收缩循环导致每次重绘画布变小）
+            host_widget=None,
+        )
+        # 预览缩放：放大查看细节（不影响成片，仅预览显示）
+        zoom = self._preview_zoom_factor()
+        return max(1, int(base_w * zoom)), max(1, int(base_h * zoom))
 
     def draw_subtitle_preview(self):
         for child in self.sub_preview_canvas.children(): child.deleteLater()
@@ -232,6 +300,7 @@ class SubtitleMixin:
         else:
             self.sub_preview_canvas.setFixedSize(*self._subtitle_preview_size())
             design_w = 1920
+        self._sync_preview_scroll_size(getattr(self, 'sub_preview_scroll', None), self.sub_preview_canvas)
         scale_ratio = self.sub_preview_canvas.width() / design_w
         if self.sub_preview_bg_path and os.path.exists(self.sub_preview_bg_path):
             bg_lbl = QLabel(self.sub_preview_canvas); bg_lbl.setGeometry(0, 0, self.sub_preview_canvas.width(), self.sub_preview_canvas.height())
@@ -268,7 +337,7 @@ class SubtitleMixin:
             family = self.preview_font_family(self.sub_font.currentText())
             if family:
                 font.setFamily(family)
-            font.setPointSize(font_size); font.setBold(preset_bold); temp_lbl.setFont(font); temp_lbl.adjustSize()
+            font.setPixelSize(font_size); font.setBold(preset_bold); temp_lbl.setFont(font); temp_lbl.adjustSize()
             line_y = canvas_h - margin_v_scaled - (len(lines) - i) * font_size * 1.3
             final_x = (canvas_w - temp_lbl.width()) / 2
             temp_lbl.deleteLater()

@@ -170,7 +170,15 @@ def _log_retention_days(filename):
         return 0
     if lowered.startswith("developer_feedback_"):
         return FEEDBACK_LOG_RETENTION_DAYS
-    if lowered.startswith(("ffmpeg_fail_", "close_event_", "app_live_")):
+    if lowered.startswith(
+        (
+            "ffmpeg_fail_",
+            "close_event_",
+            "app_live_",
+            "render_performance_",
+            "quick_trim_resume_",
+        )
+    ):
         return RUNTIME_LOG_RETENTION_DAYS
     # 固定名称的 latest / 环境报告会被覆盖写入，不按历史文件删除。
     if "latest" in lowered or lowered.endswith("_env_report.txt"):

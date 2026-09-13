@@ -96,6 +96,7 @@ class RenderTaskConfig:
     mixer_mode: str = "traditional"
     gpu_mode: str = "CPU 软解"
     threads: int = 1
+    auto_performance: bool = True
     loop_count: int = 1
     resolution: str = "720x1280 (竖屏)"
     target_w: int = 720
@@ -110,6 +111,7 @@ class RenderTaskConfig:
     bgm_vol: float = 0.2
     smart_sfx_enabled: bool = False
     smart_sfx_strength: str = "standard"
+    fast_render_enabled: bool = True
     ai_intro_mode: bool = False
     anti_dedup: bool = True
     lut_style: str = "none"
@@ -128,6 +130,13 @@ class RenderTaskConfig:
     overlay_zoom_min: float = 1.01
     overlay_zoom_max: float = 1.10
     overlay_zoom_mode: str = "slow_push_in"
+    # 参数防重抖动：让每条成片的固定参数（开头时长/强结构节点/转场时长/音量）在
+    # ±ratio 内随机浮动，避免同一批成片的时间轴骨架完全一致被平台判重复。
+    # 0 表示关闭（保持原有固定值行为）。
+    param_jitter: float = 0.15
+    # 公平轮转配额：单个队列任务每轮最多产出该数量的成片后让位其它任务
+    # （任务保持 waiting + 断点续传，由调度器轮转下一店铺）。0 = 关闭。
+    fair_quota: int = 0
     overlay_offset_strength: Optional[float] = None
     legacy_overlay_offset: Optional[float] = None
     sub_config: Dict[str, Any] = field(default_factory=dict)
@@ -142,7 +151,15 @@ class RenderTaskConfig:
     def from_dict(cls, data: Dict[str, Any]) -> "RenderTaskConfig":
         data = data or {}
         mixer_mode = str(data.get("mixer_mode") or "traditional")
-        if mixer_mode not in {"traditional", "ordinary", "first_track", "ai_intro_first_track"}:
+        # ordinary（原"普通视频拼接"）与 traditional 引擎行为完全一致，统一归并为 traditional
+        if mixer_mode == "ordinary":
+            mixer_mode = "traditional"
+        if mixer_mode not in {
+            "traditional",
+            "first_track",
+            "ai_intro_first_track",
+            "ai_intro_audio",
+        }:
             mixer_mode = "traditional"
         target_w, target_h = parse_target_resolution(data.get("resolution", "720x1280 (竖屏)"))
         overlay_gap_min = max(0.0, _as_float(data.get("overlay_gap_min"), 1.5))
@@ -173,6 +190,7 @@ class RenderTaskConfig:
             mixer_mode=mixer_mode,
             gpu_mode=str(data.get("gpu_mode") or "CPU 软解"),
             threads=max(1, _as_int(data.get("threads"), 1)),
+            auto_performance=_as_bool(data.get("auto_performance"), True),
             loop_count=max(1, _as_int(data.get("loop_count"), 1)),
             resolution=str(data.get("resolution") or "720x1280 (竖屏)"),
             target_w=target_w,
@@ -187,6 +205,7 @@ class RenderTaskConfig:
             bgm_vol=max(0.0, _as_float(data.get("bgm_vol"), 0.2)),
             smart_sfx_enabled=_as_bool(data.get("smart_sfx_enabled"), False),
             smart_sfx_strength=smart_sfx_strength,
+            fast_render_enabled=_as_bool(data.get("fast_render_enabled"), True),
             ai_intro_mode=_as_bool(data.get("ai_intro_mode"), False),
             anti_dedup=_as_bool(data.get("anti_dedup"), True),
             lut_style=normalize_lut_style(data.get("lut_style")),
@@ -205,6 +224,8 @@ class RenderTaskConfig:
             overlay_zoom_min=overlay_zoom_min,
             overlay_zoom_max=overlay_zoom_max,
             overlay_zoom_mode=overlay_zoom_mode,
+            param_jitter=max(0.0, min(0.5, _as_float(data.get("param_jitter"), 0.15))),
+            fair_quota=max(0, _as_int(data.get("fair_quota"), 0)),
             overlay_offset_strength=offset_strength,
             legacy_overlay_offset=legacy_offset,
             sub_config=dict(sub_config),

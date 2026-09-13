@@ -144,3 +144,57 @@ def render_style_swatch(preset, size=(100, 42)):
     painter.drawText(QPoint(x, y), text)
     painter.end()
     return pix
+
+
+def random_style():
+    """随机返回一个花字预设（供"🎲 随机"按钮使用）。"""
+    import random
+    return random.choice(SUB_STYLES) if SUB_STYLES else None
+
+
+def color_to_combo_item(color, combo):
+    """把花字预设的 hex 颜色映射到颜色下拉里的可选项。
+
+    优先精确匹配（hex 或色名）；找不到时将 hex 作为新项插入下拉并选中，
+    保证随机颜色一定能生效。
+    """
+    if not color or combo is None:
+        return None
+    text = str(color)
+    # 1. 精确匹配下拉现有项
+    idx = combo.findText(text)
+    if idx >= 0:
+        return idx
+    idx = combo.findText(text.lower())
+    if idx >= 0:
+        return idx
+    # 2. 用 QColor 解析 hex，找同色的色名项
+    try:
+        from PyQt5.QtGui import QColor
+        qc = QColor(text)
+        if qc.isValid():
+            target = qc.name().upper()
+            for i in range(combo.count()):
+                item = combo.itemText(i)
+                if not item or item.startswith(("🎲", "🎨")):
+                    continue
+                try:
+                    if QColor(item).isValid() and QColor(item).name().upper() == target:
+                        return i
+                except Exception:
+                    pass
+    except Exception:
+        pass
+    # 3. 插入新色项（带色块图标），返回索引
+    try:
+        from PyQt5.QtGui import QColor, QIcon, QPixmap
+        qc = QColor(text)
+        if qc.isValid():
+            pixmap = QPixmap(16, 16)
+            pixmap.fill(qc)
+            # index 0 通常为"🎨 自定义取色盘"，插到其后
+            combo.insertItem(2, QIcon(pixmap), qc.name().upper())
+            return 2
+    except Exception:
+        pass
+    return None

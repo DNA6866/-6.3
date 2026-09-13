@@ -1486,6 +1486,9 @@ class QuickVideoTrimWidget(QWidget):
             worker.finished.connect(lambda *_: self._cleanup_preview_workers())
             worker.failed.connect(lambda *_: self._cleanup_preview_workers())
             self.preview_workers.append(worker)
+            registry = getattr(self, "_thread_registry", None)
+            if registry is not None:
+                registry.register(worker, "快速剪辑预览", worker.cancel)
             worker.start()
         self._refresh_segment_table()
 
@@ -1764,6 +1767,9 @@ class QuickVideoTrimWidget(QWidget):
         if not path or index < 0 or not segment:
             QMessageBox.information(self, "未选择片段", "请先在右侧选择需要更新的高潮片段。")
             return
+        if path != self.current_path:
+            QMessageBox.information(self, "请等待预览切换", "请先切换到该片段所属视频，再调整入点和出点。")
+            return
         if not candidate:
             QMessageBox.warning(self, "标记不完整", "请设置有效的入点和出点。")
             return
@@ -1893,6 +1899,8 @@ class QuickVideoTrimWidget(QWidget):
             mode,
             profile.get("level", "cpu"),
         )
+        self._export_total = len(tasks)
+        self._export_stop_requested = False
         self.export_worker.progress.connect(
             lambda value, current, total: self.export_progress.setValue(value)
         )
@@ -1902,6 +1910,13 @@ class QuickVideoTrimWidget(QWidget):
         )
         self.export_worker.finished.connect(self._on_export_finished)
         self.export_worker.failed.connect(self._on_export_failed)
+        registry = getattr(self, "_thread_registry", None)
+        if registry is not None:
+            registry.register(
+                self.export_worker,
+                "快速剪辑导出",
+                self.export_worker.cancel,
+            )
         self.export_current_button.setEnabled(False)
         self.export_all_button.setEnabled(False)
         self.stop_export_button.setEnabled(True)
@@ -1917,14 +1932,17 @@ class QuickVideoTrimWidget(QWidget):
         self.export_current_button.setEnabled(True)
         self.export_all_button.setEnabled(True)
         self.stop_export_button.setEnabled(False)
-        if success and not failed:
+        stopped = bool(getattr(self, '_export_stop_requested', False))
+        if success and not failed and not stopped:
             self.export_progress.setValue(100)
-        self.export_status.setText(f"导出结束：成功 {success} 个，失败 {failed} 个。")
-        self._log(f"导出结束：成功 {success} 个，失败 {failed} 个，目录：{output_dir}")
+        state = "导出已停止" if stopped else "导出结束"
+        remaining = max(0, getattr(self, '_export_total', success + failed) - success - failed)
+        self.export_status.setText(f"{state}：成功 {success} 个，失败 {failed} 个，未完成 {remaining} 个。")
+        self._log(f"{state}：成功 {success} 个，失败 {failed} 个，未完成 {remaining} 个，目录：{output_dir}")
         QMessageBox.information(
             self,
-            "导出完成",
-            f"独立片段导出完成。\n成功：{success}\n失败：{failed}\n目录：{output_dir}",
+            state,
+            f"{state}。\n成功：{success}\n失败：{failed}\n未完成：{remaining}\n目录：{output_dir}",
         )
 
     def _on_export_failed(self, message):
@@ -1937,6 +1955,7 @@ class QuickVideoTrimWidget(QWidget):
 
     def stop_export(self):
         if self.export_worker and self.export_worker.isRunning():
+            self._export_stop_requested = True
             self.export_status.setText("正在停止导出...")
             self.export_worker.cancel()
 

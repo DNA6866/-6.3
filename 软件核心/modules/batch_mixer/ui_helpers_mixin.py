@@ -1,11 +1,83 @@
 from PyQt5.QtCore import Qt, QSize
 from PyQt5.QtGui import QColor, QIcon, QPixmap
-from PyQt5.QtWidgets import QAbstractSpinBox, QColorDialog, QLabel, QSizePolicy, QFrame, QVBoxLayout
+from PyQt5.QtWidgets import (
+    QAbstractSpinBox,
+    QColorDialog,
+    QHBoxLayout,
+    QLabel,
+    QSizePolicy,
+    QSpinBox,
+    QFrame,
+    QVBoxLayout,
+)
 
 from utils import EXTENDED_COLORS
 
 
 class UIHelpersMixin:
+    # ───────── 预览共用：底图比例自适应 + 缩放 ─────────
+    def _preview_design_size_with_bg(self, design_w, design_h, bg_path):
+        """有参考底图时按底图比例调整设计尺寸。
+
+        预览画布比例 = 底图比例 → 底图铺满画布无黑边，
+        文字/水印位置相对底图所见即所得（底图=视频帧时与成片完全一致）。
+        """
+        import os
+        try:
+            if bg_path and os.path.exists(bg_path):
+                pm = QPixmap(bg_path)
+                if pm.width() > 0 and pm.height() > 0 and pm.width() != pm.height():
+                    return design_w, max(1, int(round(design_w * pm.height() / pm.width())))
+        except Exception:
+            pass
+        return design_w, design_h
+
+    def _preview_zoom_factor(self):
+        """当前预览缩放系数（1.0 = 100%）。"""
+        try:
+            return max(0.5, min(4.0, float(getattr(self, '_preview_zoom', 1.0) or 1.0)))
+        except (TypeError, ValueError):
+            return 1.0
+
+    def _make_preview_zoom_spin(self, on_change):
+        """创建「预览缩放」百分比控件（50%~400%，默认100%），放大查看细节。"""
+        import os
+        row = QHBoxLayout()
+        label = QLabel("预览缩放:")
+        zoom_spin = QSpinBox()
+        zoom_spin.setRange(50, 400)
+        zoom_spin.setValue(100)
+        zoom_spin.setSuffix(" %")
+        zoom_spin.setSingleStep(25)
+        zoom_spin.setFixedWidth(86)
+        zoom_spin.setToolTip(
+            "放大预览画面查看细节（不影响成片，仅放大预览显示）。\n"
+            "100% = 适配面板的默认大小。"
+        )
+        zoom_spin.wheelEvent = lambda event: event.ignore()
+
+        def _apply(value):
+            self._preview_zoom = max(0.5, min(4.0, value / 100.0))
+            on_change()
+
+        zoom_spin.valueChanged.connect(_apply)
+        row.addWidget(label)
+        row.addWidget(zoom_spin)
+        row.addStretch(1)
+        return row
+
+    def _sync_preview_scroll_size(self, scroll, canvas, pad=6):
+        """滚动容器尺寸跟随画布（缩放后可滚动查看放大区域）。"""
+        if scroll is None or canvas is None:
+            return
+        try:
+            scroll.setFixedSize(
+                min(760, canvas.width() + pad),
+                min(900, canvas.height() + pad),
+            )
+        except Exception:
+            pass
+
     def populate_color_combo(self, combo):
         combo.clear(); combo.addItem("🎨 自定义取色盘...")
         for c in EXTENDED_COLORS:

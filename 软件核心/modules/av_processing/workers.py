@@ -395,15 +395,25 @@ class AVProcessWorker(QThread):
         try:
             jobs = self.task.get('jobs', [self.task])
             outputs = []
+            self.output_paths = outputs
+            errors = []
             total = max(1, len(jobs))
             self.progress_signal.emit(2)
             for idx, job in enumerate(jobs, 1):
                 self.log_signal.emit(f"开始处理 {idx}/{total}: {os.path.basename(job['input'])}")
-                self._process_one(job)
-                outputs.append(job['output'])
+                try:
+                    self._process_one(job)
+                    outputs.append(job['output'])
+                except Exception as exc:
+                    error = f"{os.path.basename(job.get('input', ''))}：{exc}"
+                    errors.append(error)
+                    self.log_signal.emit(f"处理失败，继续下一个文件：{error}")
                 self.progress_signal.emit(int(idx / total * 100))
             self.progress_signal.emit(100)
-            self.finished_signal.emit(True, "；".join(outputs))
+            if errors:
+                self.finished_signal.emit(False, f"已完成 {len(outputs)} 个，失败 {len(errors)} 个；成功文件已保留。\n" + "\n".join(errors))
+            else:
+                self.finished_signal.emit(True, "；".join(outputs))
         except Exception as e:
             self.finished_signal.emit(False, str(e))
 
@@ -471,8 +481,9 @@ class AddSubtitleWorker(QThread):
             raise RuntimeError(" | ".join(lines[-6:]) if lines else "处理失败")
         return res.stdout or ""
 
-    def _whisper_exe(self):
-        tools_dir = self.task.get('tools_dir', '')
+    def _whisper_exe(self, tools_dir=None):
+        # 多视频重构后 self.task 是 {'jobs': [...]}，tools_dir 必须从 job 参数取
+        tools_dir = tools_dir or self.task.get('tools_dir', '')
         for rel in ['nv/whisper.exe', 'amd/whisper.exe', 'cpu/whisper.exe', 'whisper_cpu.exe', 'whisper.exe']:
             path = os.path.join(tools_dir, rel)
             if os.path.exists(path):
@@ -526,53 +537,66 @@ class AddSubtitleWorker(QThread):
                        '-i', input_path, '-vn', '-ar', '16000', '-ac', '1',
                        '-c:a', 'pcm_s16le', wav_path])
 
-    def _transcribe(self, ffmpeg, ffprobe, tools_dir, models_dir, audio_path, cache_dir):
-        """ASR：优先 SenseVoice 隔离识别，失败回退 Whisper 词级时间轴。返回 (srt_path, 引擎名)。"""
-        # 1. SenseVoice
+    def _transcribe(self, ffmpeg, ffprobe, tools_dir, models_dir, audio_path, cache_dir, max_chars=None):
+        """ASR：优先 Whisper 词级时间轴（真实停顿，字幕准），
+        SenseVoice 仅作回退（时间轴为估算）。返回 (srt_path, 引擎名)。"""
+        # 1. Whisper 词级时间轴（精准，推荐）
+        whisper_exe = self._whisper_exe(tools_dir)
+        models = sorted(
+            (f for f in os.listdir(tools_dir) if f.endswith('.bin')),
+            key=lambda n: os.path.getsize(os.path.join(tools_dir, n)),
+            reverse=True,  # 优先用最大的模型（通常最准）
+        )
+        if whisper_exe and models:
+            try:
+                model_path = os.path.join(tools_dir, models[0])
+                self._log(f"正在使用 Whisper 生成精准时间轴（模型：{models[0]}，稍慢）...")
+                from services.asr_service import transcribe_with_whisper_word_timestamps
+                word_srt = os.path.join(cache_dir, "subtitle_whisper_word.srt")
+                silence_intervals = self._silence_intervals(ffmpeg, audio_path)
+                actual_srt, _segments = transcribe_with_whisper_word_timestamps(
+                    whisper_exe, model_path, ffmpeg, audio_path, word_srt,
+                    timeout_sec=900, silence_intervals=silence_intervals,
+                    max_chars=max_chars,
+                )
+                if actual_srt and os.path.exists(actual_srt) and os.path.getsize(actual_srt) > 0:
+                    return actual_srt, "Whisper"
+            except Exception as exc:
+                self._log(f"Whisper 识别失败，尝试 SenseVoice 回退: {exc}")
+
+        # 2. SenseVoice 回退（文本无时间戳，时间轴为静音估算）
         sensevoice_dir = os.path.join(models_dir, 'SenseVoiceSmall')
         if os.path.isdir(sensevoice_dir) and os.path.exists(os.path.join(sensevoice_dir, 'model.pt')):
             try:
-                self._log("正在使用 SenseVoice 识别语音...")
+                self._log("正在使用 SenseVoice 快速识别（时间轴为估算）...")
                 from services.asr_service import SenseVoiceIsolatedSession
+                # 多视频循环：先关闭上一个视频的会话，避免子进程泄漏
+                if self._sensevoice_session:
+                    try:
+                        self._sensevoice_session.close()
+                    except Exception:
+                        pass
                 self._sensevoice_session = SenseVoiceIsolatedSession(sensevoice_dir, timeout_sec=300)
                 text, _device = self._sensevoice_session.transcribe(audio_path, timeout_sec=300)
                 text = (text or "").strip()
                 if text:
                     duration = self._media_duration(ffprobe, audio_path)
                     srt_path = os.path.join(cache_dir, "subtitle_sensevoice.srt")
-                    # 用静音检测做分句对齐，避免整段文本按总时长均分导致字幕漂移
-                    self._log("正在根据语音停顿对齐字幕时间轴...")
                     silence_points = self._silence_points(ffmpeg, audio_path)
-                    aligned = self._write_srt_aligned(text, duration, silence_points, srt_path)
-                    if aligned and os.path.exists(srt_path) and os.path.getsize(srt_path) > 0:
-                        return srt_path, "SenseVoice"
-                self._log("SenseVoice 未识别到文字，尝试 Whisper 回退。")
+                    from services.asr_service import write_srt_aligned_from_text
+                    write_srt_aligned_from_text(
+                        text, duration, silence_points, srt_path, max_chars=max_chars,
+                    )
+                    if os.path.exists(srt_path) and os.path.getsize(srt_path) > 0:
+                        return srt_path, "SenseVoice(估算)"
+                self._log("SenseVoice 未识别到文字。")
             except Exception as exc:
-                self._log(f"SenseVoice 识别失败，尝试 Whisper 回退: {exc}")
-
-        # 2. Whisper 词级时间轴
-        whisper_exe = self._whisper_exe()
-        models = [f for f in os.listdir(tools_dir) if f.endswith('.bin')]
-        if whisper_exe and models:
-            try:
-                self._log("正在使用 Whisper 生成词级时间轴（稍慢）...")
-                from services.asr_service import transcribe_with_whisper_word_timestamps
-                word_srt = os.path.join(cache_dir, "subtitle_whisper_word.srt")
-                actual_srt, _segments = transcribe_with_whisper_word_timestamps(
-                    whisper_exe, models[0], ffmpeg, audio_path, word_srt, timeout_sec=900,
-                )
-                if actual_srt and os.path.exists(actual_srt) and os.path.getsize(actual_srt) > 0:
-                    return actual_srt, "Whisper"
-            except Exception as exc:
-                self._log(f"Whisper 词级时间轴失败: {exc}")
-        elif not whisper_exe:
-            self._log("未找到 whisper.exe，仅使用 SenseVoice。")
+                self._log(f"SenseVoice 回退识别失败: {exc}")
 
         return None, ""
 
     def _srt_to_ass(self, srt_path, sub_style):
         """将 SRT 转成带样式的 ASS，返回 ass_path。"""
-        import re as _re
         # 视频实际分辨率（横/竖屏自适应），默认竖屏基准
         play_w = int(sub_style.get('play_res_w', 1080) or 1080)
         play_h = int(sub_style.get('play_res_h', 1920) or 1920)
@@ -599,7 +623,9 @@ class AddSubtitleWorker(QThread):
             return 0.0
 
         def fmt_ts(sec):
-            h = int(sec // 3600); m = int((sec % 3600) // 60); s = sec % 60
+            h = int(sec // 3600)
+            m = int((sec % 3600) // 60)
+            s = sec % 60
             return f"{h:01d}:{m:02d}:{s:05.2f}"
 
         font_size = int(sub_style.get('size', 72))
@@ -651,10 +677,17 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
                 while i < len(lines) and lines[i].strip():
                     texts.append(lines[i].strip())
                     i += 1
-                text = "\\N".join(texts)
+                text = " ".join(texts)
                 if text:
+                    # 字号恒定模式：超宽时按画面容量自动多行（最多3行），
+                    # 每行必在可用宽度内（切条字数上限与渲染宽度同源），不缩字不溢出。
+                    from services.asr_service import layout_subtitle_text
+                    layout_text, _fitted = layout_subtitle_text(
+                        text, font_size=scaled_font, play_res_x=play_w, margin_side=60,
+                        max_lines=3, allow_shrink=False,
+                    )
                     events.append(
-                        f"Dialogue: 0,{fmt_ts(start_t)},{fmt_ts(end_t)},Default,,0,0,0,,{text}"
+                        f"Dialogue: 0,{fmt_ts(start_t)},{fmt_ts(end_t)},Default,,0,0,0,,{layout_text}"
                     )
             i += 1
         if not events:
@@ -665,96 +698,32 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
         return ass_path
 
     def run(self):
+        """支持多视频：逐个处理，单个失败不中断后续。"""
+        jobs = self.task.get('jobs') or [self.task]
+        outputs = []
+        self.output_paths = outputs
+        errors = []
+        total = max(1, len(jobs))
         try:
-            job = self.task
-            ffmpeg = job['ffmpeg']
-            ffprobe = job['ffprobe']
-            tools_dir = job.get('tools_dir', '')
-            models_dir = job.get('models_dir', '')
-            cache_dir = job.get('cache_dir', '')
-            input_path = job['input']
-            output_path = job['output']
-            sub_style = job.get('sub_style', {}) or {}
-            export_only = bool(job.get('export_only', False))
-            os.makedirs(cache_dir, exist_ok=True)
-
-            self.progress_signal.emit(5)
-            self._log(f"开始给视频添加字幕: {os.path.basename(input_path)}")
-
-            # 0. 无音轨检测（兼容性）
-            if not self._has_audio_stream(ffprobe, input_path):
-                raise RuntimeError("该视频没有音轨，无法识别语音生成字幕。")
-
-            # 分辨率探测（横/竖屏自适应）
-            play_w, play_h = self._probe_video_size(ffprobe, input_path)
-            sub_style = dict(sub_style)
-            sub_style['play_res_w'] = play_w
-            sub_style['play_res_h'] = play_h
-            self._log(f"视频分辨率 {play_w}x{play_h}，字幕按此比例适配。")
-
-            # 1. 识别缓存：按输入文件特征缓存 SRT，避免重复识别
-            cache_key = self._build_cache_key(input_path)
-            cached_srt = self._load_cached_srt(cache_dir, cache_key)
-            wav_path = ""
-            if cached_srt:
-                srt_path = cached_srt
-                engine_name = "缓存"
-                self._log("命中字幕识别缓存，跳过语音识别。")
-            else:
-                wav_path = os.path.join(cache_dir, f"subtitle_{cache_key}.wav")
-                self._extract_audio(ffmpeg, input_path, wav_path)
-                self.progress_signal.emit(25)
-                self._log("音频提取完成，开始语音识别...")
-                # 2. ASR
-                srt_path, engine_name = self._transcribe(
-                    ffmpeg, ffprobe, tools_dir, models_dir, wav_path, cache_dir,
-                )
-                if not srt_path:
-                    raise RuntimeError("语音识别未生成有效字幕（SenseVoice/Whisper 均不可用）")
-                self._save_cached_srt(cache_dir, cache_key, srt_path)
-            self.progress_signal.emit(60)
-            self._log(f"语音识别完成（{engine_name}），正在生成字幕样式...")
-
-            # 3. SRT → ASS
-            ass_path = self._srt_to_ass(srt_path, sub_style)
-            if not ass_path:
-                raise RuntimeError("字幕解析失败，请检查音频是否有人声")
-            self.progress_signal.emit(75)
-
-            # 仅导出字幕文件模式（不烧录）
-            if export_only:
-                export_srt = os.path.join(cache_dir, f"{os.path.splitext(os.path.basename(input_path))[0]}_字幕.srt")
-                import shutil
-                shutil.copy2(srt_path, export_srt)
-                export_ass = os.path.join(cache_dir, f"{os.path.splitext(os.path.basename(input_path))[0]}_字幕.ass")
-                shutil.copy2(ass_path, export_ass)
-                self.progress_signal.emit(100)
-                self._log(f"字幕文件已导出:\n  {export_srt}\n  {export_ass}")
-                self.finished_signal.emit(True, export_srt)
-                return
-
-            # 4. 烧录（保留原视频画面与音轨）
-            self._log("字幕样式已生成，正在烧录到视频...")
-            from utils import path_to_ffmpeg
-            safe_ass = path_to_ffmpeg(os.path.abspath(ass_path))
-            fonts_dir = path_to_ffmpeg("C:/Windows/Fonts") if os.name == "nt" else ""
-            vf = f"subtitles=filename='{safe_ass}'"
-            if fonts_dir:
-                vf += f":fontsdir='{fonts_dir}'"
-            burn_cmd = [
-                ffmpeg, '-y', '-hide_banner', '-loglevel', 'error',
-                '-i', input_path,
-                '-vf', vf,
-                '-map', '0:v:0', '-map', '0:a?',
-                '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '18', '-pix_fmt', 'yuv420p',
-                '-c:a', 'copy',
-                '-movflags', '+faststart',
-                output_path,
-            ]
-            self._run_cmd(burn_cmd)
+            for idx, job in enumerate(jobs, 1):
+                if not self.task.get('jobs') and idx > 1:
+                    break
+                self._idx, self._total = idx, total
+                name = os.path.basename(job.get('input', '') or '')
+                self._log(f"—— 开始处理第 {idx}/{total} 个视频: {name} ——")
+                try:
+                    outputs.append(self._process_one(job))
+                except Exception as exc:
+                    errors.append(f"{name}: {exc}")
+                    self._log(f"❌ {name} 处理失败: {exc}")
             self.progress_signal.emit(100)
-            self._log(f"字幕烧录完成: {os.path.basename(output_path)}")
-            self.finished_signal.emit(True, output_path)
+            if outputs:
+                msg = "；".join(str(p) for p in outputs)
+                if errors:
+                    msg += f"\n\n⚠ 有 {len(errors)} 个视频处理失败：\n" + "\n".join(errors)
+                self.finished_signal.emit(not errors, msg)
+            else:
+                self.finished_signal.emit(False, errors[0] if errors else "没有可处理的视频")
         except Exception as exc:
             self.finished_signal.emit(False, str(exc))
         finally:
@@ -764,11 +733,134 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
             except Exception:
                 pass
 
-    def _build_cache_key(self, input_path):
-        """基于文件大小+修改时间生成缓存标识。"""
+    def _emit_step(self, step):
+        """把单视频步骤进度映射到多视频整体进度。"""
+        total = max(1, getattr(self, '_total', 1))
+        idx = max(1, getattr(self, '_idx', 1))
+        self.progress_signal.emit(int(((idx - 1) + step / 100.0) / total * 100))
+
+    def _process_one(self, job):
+        ffmpeg = job['ffmpeg']
+        ffprobe = job['ffprobe']
+        tools_dir = job.get('tools_dir', '')
+        models_dir = job.get('models_dir', '')
+        cache_dir = job.get('cache_dir', '')
+        input_path = job['input']
+        output_path = job['output']
+        sub_style = job.get('sub_style', {}) or {}
+        export_only = bool(job.get('export_only', False))
+        os.makedirs(cache_dir, exist_ok=True)
+
+        self._emit_step(5)
+        self._log(f"开始给视频添加字幕: {os.path.basename(input_path)}")
+
+        # 0. 无音轨检测（兼容性）
+        if not self._has_audio_stream(ffprobe, input_path):
+            raise RuntimeError("该视频没有音轨，无法识别语音生成字幕。")
+
+        # 分辨率探测（横/竖屏自适应）
+        play_w, play_h = self._probe_video_size(ffprobe, input_path)
+        sub_style = dict(sub_style)
+        sub_style['play_res_w'] = play_w
+        sub_style['play_res_h'] = play_h
+        self._log(f"视频分辨率 {play_w}x{play_h}，字幕按此比例适配。")
+
+        # 字号恒定模式：按画面容量动态推导"单条字数上限"，
+        # 保证两行内放得下、不横向溢出（与 _srt_to_ass 同一换算链）。
+        scaled_font, line_capacity, dynamic_max_chars = self._subtitle_layout_params(
+            play_w, play_h, sub_style,
+        )
+        self._log(
+            f"字幕字号（成片像素）{scaled_font}，每行约 {line_capacity} 字，"
+            f"单条上限 {dynamic_max_chars} 字。"
+        )
+
+        # 1. 识别缓存：按输入文件特征+字号缓存 SRT（字号变了切条宽度不同，需重切）
+        cache_key = self._build_cache_key(input_path, sub_style.get('size', 0))
+        cached_srt = self._load_cached_srt(cache_dir, cache_key)
+        wav_path = ""
+        if cached_srt:
+            srt_path = cached_srt
+            engine_name = "缓存"
+            self._log("命中字幕识别缓存，跳过语音识别。")
+        else:
+            wav_path = os.path.join(cache_dir, f"subtitle_{cache_key}.wav")
+            self._extract_audio(ffmpeg, input_path, wav_path)
+            self._emit_step(25)
+            self._log("音频提取完成，开始语音识别...")
+            # 2. ASR
+            srt_path, engine_name = self._transcribe(
+                ffmpeg, ffprobe, tools_dir, models_dir, wav_path, cache_dir,
+                max_chars=dynamic_max_chars,
+            )
+            if not srt_path:
+                raise RuntimeError("语音识别未生成有效字幕（SenseVoice/Whisper 均不可用）")
+            self._save_cached_srt(cache_dir, cache_key, srt_path)
+        self._emit_step(60)
+        self._log(f"语音识别完成（{engine_name}），正在生成字幕样式...")
+
+        # 3. SRT → ASS
+        ass_path = self._srt_to_ass(srt_path, sub_style)
+        if not ass_path:
+            raise RuntimeError("字幕解析失败，请检查音频是否有人声")
+        self._emit_step(75)
+
+        # 仅导出字幕文件模式（不烧录）
+        if export_only:
+            export_srt = os.path.join(cache_dir, f"{os.path.splitext(os.path.basename(input_path))[0]}_字幕.srt")
+            import shutil
+            shutil.copy2(srt_path, export_srt)
+            export_ass = os.path.join(cache_dir, f"{os.path.splitext(os.path.basename(input_path))[0]}_字幕.ass")
+            shutil.copy2(ass_path, export_ass)
+            self._emit_step(100)
+            self._log(f"字幕文件已导出:\n  {export_srt}\n  {export_ass}")
+            return export_srt
+
+        # 4. 烧录（保留原视频画面与音轨）
+        self._log("字幕样式已生成，正在烧录到视频...")
+        from utils import path_to_ffmpeg
+        safe_ass = path_to_ffmpeg(os.path.abspath(ass_path))
+        fonts_dir = path_to_ffmpeg("C:/Windows/Fonts") if os.name == "nt" else ""
+        vf = f"subtitles=filename='{safe_ass}'"
+        if fonts_dir:
+            vf += f":fontsdir='{fonts_dir}'"
+        burn_cmd = [
+            ffmpeg, '-y', '-hide_banner', '-loglevel', 'error',
+            '-i', input_path,
+            '-vf', vf,
+            '-map', '0:v:0', '-map', '0:a?',
+            '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '18', '-pix_fmt', 'yuv420p',
+            '-c:a', 'copy',
+            '-movflags', '+faststart',
+            output_path,
+        ]
+        self._run_cmd(burn_cmd)
+        self._emit_step(100)
+        self._log(f"字幕烧录完成: {os.path.basename(output_path)}")
+        return output_path
+
+    def _subtitle_layout_params(self, play_w, play_h, sub_style):
+        """按成片换算链推导：scaled_font、每行容量、动态条目字数上限。
+
+        与 _srt_to_ass 完全同源，保证"切条字数上限"与"渲染宽度"一致，
+        字号恒定（不缩字）也不会横向溢出。
+        """
+        size = int(sub_style.get('size', 72) or 72)
+        base_w, base_h = 1080, 1920
+        ratio = (play_w / base_w) if play_w < play_h else (play_h / base_h)
+        scaled_font = max(10, int(size * ratio))
+        margin_side = 60
+        available = max(120.0, float(play_w) - 2.0 * margin_side)
+        line_capacity = max(3, int(available / (scaled_font * 0.96)))
+        # 单条 = 最多两行；与全局 20 字上限取小
+        dynamic_max = max(6, min(20, line_capacity * 2))
+        return scaled_font, line_capacity, dynamic_max
+
+    def _build_cache_key(self, input_path, font_size=0):
+        """基于文件大小+修改时间+字号生成缓存标识（字号变化 → 重新切条）。"""
         try:
             st = os.stat(input_path)
-            return f"{st.st_size}_{int(st.st_mtime)}"
+            return f"{st.st_size}_{int(st.st_mtime)}_{int(font_size or 0)}"
         except Exception:
             return str(abs(hash(os.path.abspath(input_path))) % 1000000)
 
@@ -805,64 +897,13 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
         except Exception:
             return []
 
+    def _silence_intervals(self, ffmpeg, audio_path):
+        """静音区间 [(start, end), ...]——委托 asr_service 共享实现。"""
+        from services.asr_service import detect_silence_intervals
+        return detect_silence_intervals(ffmpeg, audio_path)
+
     def _write_srt_aligned(self, text, duration, silence_points, srt_path):
-        """将整段文本按静音点分配时间轴，近似对齐语音节奏。
-
-        策略：
-          - 文本按语句切分成 N 段；
-          - 将 N 段映射到时长轴上，段边界尽量贴近最近静音点；
-          - 生成 SRT，时间点与停顿对齐，避免整段均分漂移。
-        """
-        import re as _re
-        from services.asr_service import split_text_for_subtitle, clean_asr_text
-
-        text = clean_asr_text(text)
-        parts = split_text_for_subtitle(text)
-        if not parts:
-            return False
-        if duration <= 0:
-            duration = 10.0
-
-        # 候选切分点：0 和 duration 之间均匀插入 N-1 个理想切点，吸附到最近静音点
-        cuts = []
-        if len(parts) > 1:
-            for i in range(1, len(parts)):
-                ideal = duration * i / len(parts)
-                if silence_points:
-                    nearest = min(silence_points, key=lambda p: abs(p - ideal))
-                    # 只允许吸附在理想点前后 15% 范围内，避免过度偏移
-                    if abs(nearest - ideal) <= duration * 0.15:
-                        cuts.append(nearest)
-                    else:
-                        cuts.append(ideal)
-                else:
-                    cuts.append(ideal)
-            cuts = sorted(set(round(c, 2) for c in cuts))
-            # 去重过近的切点
-            filtered = []
-            for c in cuts:
-                if filtered and c - filtered[-1] < 0.25:
-                    continue
-                filtered.append(c)
-            cuts = filtered
-
-        # 组装事件：start/end
-        events = []
-        prev = 0.0
-        for idx, part in enumerate(parts):
-            end = cuts[idx] if idx < len(cuts) else duration
-            end = max(prev + 0.2, min(duration, end))
-            if end - prev < 0.2:
-                end = min(duration, prev + 0.2)
-            events.append((prev, end, part))
-            prev = end
-
-        def fmt_ts(sec):
-            h = int(sec // 3600); m = int((sec % 3600) // 60); s = sec % 60
-            return f"{h:02d}:{m:02d}:{s:06.3f}".replace('.', ',')
-
-        with open(srt_path, 'w', encoding='utf-8') as f:
-            for idx, (start, end, content) in enumerate(events, 1):
-                f.write(f"{idx}\n{fmt_ts(start)} --> {fmt_ts(end)}\n{content}\n\n")
-        return True
+        """已迁移到 services.asr_service.write_srt_aligned_from_text（共享给批量混剪使用）。"""
+        from services.asr_service import write_srt_aligned_from_text
+        return bool(write_srt_aligned_from_text(text, duration, silence_points, srt_path))
 

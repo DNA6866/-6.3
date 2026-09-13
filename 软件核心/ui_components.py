@@ -28,6 +28,7 @@ from PyQt5.QtWidgets import (
 )
 
 from utils import get_system_fonts
+from services.media_index_service import get_media_index
 from services.platform_service import resolve_network_path
 
 
@@ -518,19 +519,32 @@ class DirectoryScanWorker(QThread):
     scan_finished = pyqtSignal(str, str, int, object)
     scan_failed = pyqtSignal(str, str, int, str)
 
-    def __init__(self, tab_name, folder_path, allowed_exts, request_id):
+    def __init__(self, tab_name, folder_path, allowed_exts, request_id, force_refresh=False):
         super().__init__()
         self.tab_name = str(tab_name)
         self.folder_path = os.path.abspath(folder_path)
         self.scan_path = resolve_network_path(self.folder_path)
         self.allowed_exts = tuple(str(ext).lower() for ext in (allowed_exts or []))
         self.request_id = int(request_id)
+        self.force_refresh = bool(force_refresh)
 
     def run(self):
         try:
             is_network = self.scan_path.startswith("\\\\")
-            if not is_network:
-                os.makedirs(self.scan_path, exist_ok=True)
+            media_index = get_media_index()
+            cached_files, cache_fresh = (None, False) if self.force_refresh else media_index.cached_directory(
+                self.scan_path, self.allowed_exts,
+            )
+            if cached_files and not self.force_refresh and not self.isInterruptionRequested():
+                # 先显示上次完整索引；过期时继续在后台增量核对，不阻塞界面。
+                self.scan_finished.emit(
+                    self.tab_name,
+                    self.folder_path,
+                    self.request_id,
+                    cached_files,
+                )
+                if cache_fresh:
+                    return
 
             attempts = 4 if is_network else 1
             last_error = ""
@@ -563,20 +577,29 @@ class DirectoryScanWorker(QThread):
                             continue
                         files.append((os.path.relpath(full_path, self.scan_path), full_path))
 
-                if walk_errors and not files and attempt + 1 < attempts:
+                if walk_errors and attempt + 1 < attempts:
                     last_error = walk_errors[0]
                     time.sleep(1.5)
                     continue
-                if walk_errors and not files:
+                if walk_errors:
                     raise OSError(walk_errors[0])
 
                 files.sort(key=lambda item: item[0].lower())
-                self.scan_finished.emit(
-                    self.tab_name,
-                    self.folder_path,
-                    self.request_id,
+                media_index.store_directory(
+                    self.scan_path,
+                    self.allowed_exts,
                     files,
                 )
+                if (
+                    (self.force_refresh or not cached_files or files != cached_files)
+                    and not self.isInterruptionRequested()
+                ):
+                    self.scan_finished.emit(
+                        self.tab_name,
+                        self.folder_path,
+                        self.request_id,
+                        files,
+                    )
                 return
 
             raise OSError(last_error or f"目录读取失败：{self.scan_path}")

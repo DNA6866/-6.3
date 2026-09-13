@@ -26,10 +26,35 @@ def import_files_to_folder(files, folder_path, allowed_exts=None):
             skipped += 1
             continue
 
-        dst = os.path.join(folder_path, os.path.basename(src))
         try:
-            if os.path.abspath(src) != os.path.abspath(dst):
-                shutil.copy2(src, dst)
+            root = os.path.abspath(folder_path)
+            filename = os.path.basename(src)
+            dst = os.path.join(root, filename)
+            if os.path.exists(dst) and os.path.samefile(src, dst):
+                skipped += 1
+                continue
+            stem, ext = os.path.splitext(filename)
+            number = 1
+            while True:
+                try:
+                    # 独占创建，不能覆盖不同子目录导入的同名素材。
+                    with open(dst, 'xb') as target:
+                        try:
+                            with open(src, 'rb') as source:
+                                shutil.copyfileobj(source, target)
+                        except Exception:
+                            target.close()
+                            os.remove(dst)
+                            raise
+                    break
+                except FileExistsError:
+                    number += 1
+                    dst = os.path.join(root, f"{stem}_{number}{ext}")
+            try:
+                shutil.copystat(src, dst)
+            except OSError:
+                # 文件内容已完整导入，部分网盘不支持复制时间戳，不影响导入结果。
+                pass
             imported += 1
         except Exception:
             skipped += 1
